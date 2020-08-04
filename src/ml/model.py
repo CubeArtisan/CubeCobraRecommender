@@ -1,5 +1,4 @@
-import tensorflow as tf
-from tensorflow.keras.layers import Dense,Input,Dropout
+from tensorflow.keras.layers import Dense
 from tensorflow.keras.models import Model
 
 """
@@ -17,28 +16,30 @@ Epochs: 100
 Batch Size: 64
 """
 
+
 class Encoder(Model):
     """
     Encoder part of the model -> compress dimensionality
     """
-    def __init__(self,name):
+    def __init__(self, name):
         super().__init__()
-        #self.input_drop = Dropout(0.2)
+        # self.input_drop = Dropout(0.2)
         self.encoded_1 = Dense(512, activation='relu', name=name + "_e1")
-        #self.e1_drop = Dropout(0.5)
+        # self.e1_drop = Dropout(0.5)
         self.encoded_2 = Dense(256, activation='relu', name=name + "_e2")
-        #self.e2_drop = Dropout(0.5)
+        # self.e2_drop = Dropout(0.5)
         self.encoded_3 = Dense(128, activation='relu', name=name + "_e3")
-        #self.e3_drop = Dropout(0.2)
-        self.bottleneck = Dense(64, activation='relu', name=name + "_bottleneck")
-    
+        # self.e3_drop = Dropout(0.2)
+        self.bottleneck = Dense(64, activation='relu',
+                                name=name + "_bottleneck")
+
     def call(self, x, training=None):
         encoded = self.encoded_1(x)
-        #encoded = self.e1_drop(encoded)
+        # encoded = self.e1_drop(encoded)
         encoded = self.encoded_2(encoded)
-        #encoded = self.e2_drop(encoded)
+        # encoded = self.e2_drop(encoded)
         encoded = self.encoded_3(encoded)
-        #encoded = self.e3_drop(encoded)
+        # encoded = self.e3_drop(encoded)
         return self.bottleneck(encoded)
 
     def call_for_reg(self, x):
@@ -46,7 +47,8 @@ class Encoder(Model):
         encoded = self.encoded_2(encoded)
         encoded = self.encoded_3(encoded)
         return self.bottleneck(encoded)
-    
+
+
 class Decoder(Model):
     """
     Decoder part of the model -> expand from compressed latent
@@ -54,15 +56,16 @@ class Decoder(Model):
     """
     def __init__(self, name, output_dim, output_act):
         super().__init__()
-        #self.bottleneck_drop = Dropout(0.2)
+        # self.bottleneck_drop = Dropout(0.2)
         self.decoded_1 = Dense(128, activation='relu', name=name + "_d1")
-        #self.d1_drop = Dropout(0.4)
+        # self.d1_drop = Dropout(0.4)
         self.decoded_2 = Dense(256, activation='relu', name=name + "_d2")
-        #self.d2_drop = Dropout(0.4)
+        # self.d2_drop = Dropout(0.4)
         self.decoded_3 = Dense(512, activation='relu', name=name + "_d3")
-        #self.d3_drop = Dropout(0.2)
-        self.reconstruct = Dense(output_dim, activation=output_act, name=name + "_reconstruction")
-    
+        # self.d3_drop = Dropout(0.2)
+        self.reconstruct = Dense(output_dim, activation=output_act,
+                                 name=name + "_reconstruction")
+
     def call(self, x, training=None):
         decoded = self.decoded_1(x)
         decoded = self.decoded_2(decoded)
@@ -79,24 +82,25 @@ class Decoder(Model):
     #     decoded = self.d3_drop(decoded)
     #     return self.reconstruct(decoded)
 
+
 class CC_Recommender(Model):
     """
     AutoEncoder build as a recommender system based on the following idea:
 
         If our input is a binary vector where 1 represents the presence of an
-        item in a collection, then an autoencoder trained 
+        item in a collection, then an autoencoder trained
     """
-    def __init__(self,num_cards):
+    def __init__(self, num_cards):
         super().__init__()
         self.N = num_cards
         self.encoder = Encoder("encoder")
-        #sigmoid because input is a binary vector we want to reproduce
-        self.decoder = Decoder("main",self.N,output_act='sigmoid')
-        #softmax because the graph information is probabilities
-        #self.input_noise = Dropout(0.5)
-        #self.latent_noise = Dropout(0.2)
-        self.decoder_for_reg = Decoder("reg",self.N,output_act='softmax')
-    
+        # sigmoid because input is a binary vector we want to reproduce
+        self.decoder = Decoder("main", self.N, output_act='sigmoid')
+        # softmax because the graph information is probabilities
+        # self.input_noise = Dropout(0.5)
+        # self.latent_noise = Dropout(0.2)
+        self.decoder_for_reg = Decoder("reg", self.N, output_act='softmax')
+
     def call(self, input, training=None):
         """
         input contains two things:
@@ -105,21 +109,21 @@ class CC_Recommender(Model):
 
         We run the same encoder for each type of input, but with different
         decoders. This is because the goal is to make sure that the compression
-        for collections still does a reasonable job compressing individual items.
-        So a penalty term (regularization) is added to the model in the ability to
-        reconstruct the probability distribution (adjacency matrix) on the item level
-        from the encoding. 
+        for collections still does a reasonable job compressing individual
+        items. So a penalty term (regularization) is added to the model in the
+        ability to reconstruct the probability distribution (adjacency matrix)
+        on the item level from the encoding.
 
-        The hope is that this regularization enforces this conditional probability to be
-        embedded in the recommendations. As the individual items must pull towards items
-        represented strongly within the graph.
+        The hope is that this regularization enforces this conditional
+        probability to be embedded in the recommendations. As the individual
+        items must pull towards items represented strongly within the graph.
         """
-        x,identity = input
-        #x = self.input_noise(x)
+        x, identity = input
+        # x = self.input_noise(x)
         encoded = self.encoder(x)
-        #latent_for_reconstruct = self.latent_noise(encoded)
+        # latent_for_reconstruct = self.latent_noise(encoded)
         reconstruction = self.decoder(encoded)
         encode_for_reg = self.encoder(identity)
-        #latent_for_reg = self.latent_noise(encode_for_reg)
+        # latent_for_reg = self.latent_noise(encode_for_reg)
         decoded_for_reg = self.decoder_for_reg(encode_for_reg)
         return reconstruction, decoded_for_reg
