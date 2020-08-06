@@ -1,9 +1,5 @@
 # enable sibling imports
-if __name__ == "__main__":
-    from sys import path
-    from os.path import dirname as dir
-    path.append(dir(path[0]))
-
+import json
 import os
 import random
 import sys
@@ -11,6 +7,10 @@ from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
+
+if __name__ == "__main__":
+    from os.path import dirname as dir
+    sys.path.append(dir(sys.path[0]))
 
 from generator import DataGenerator
 from model import CC_Recommender
@@ -42,9 +42,16 @@ folder = "././data/cube/"
 
 print('Loading Cube Data . . .\n')
 
-num_cards, name_lookup, card_to_int, _ = utils.get_card_maps(map_file)
+num_cards, name_lookup, card_to_int, int_to_card = \
+    utils.get_card_maps(map_file)
 
 num_cubes = utils.get_num_cubes(folder)
+
+with open('cards.json', 'r') as cardsjson:
+    cards = json.load(cardsjson)
+    cards = [cards[int_to_card[i]] for i in range(num_cards)]
+    print(cards)
+    sys.exit(0)
 
 cubes = utils.build_cubes(folder, num_cubes, num_cards, name_lookup,
                           card_to_int)
@@ -77,7 +84,7 @@ print('Setting Up Data for Training . . .\n')
 
 print('Setting Up Model . . . \n')
 
-autoencoder = CC_Recommender(num_cards)
+autoencoder = CC_Recommender(cards)
 autoencoder.compile(
     optimizer='adam',
     loss=['binary_crossentropy', 'kullback_leibler_divergence'],

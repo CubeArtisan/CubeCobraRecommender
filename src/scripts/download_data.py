@@ -22,10 +22,14 @@ def dump_objects(key: str, obj_type: str, start_index: int = 0) -> None:
             response = requests.get(f'{API_URL}/download{obj_type}s/{page}/{key}',
                                     params={'prevMax': prev_max})
             requests_json = response.json()
+            logging.info(requests_json)
+            logging.info(response.status_code)
             page_count = requests_json.get('pages', 1)
             prev_max = requests_json.get('prevMax', '')
-            with open(f'data/{obj_type}/{obj_type}.{page}.json', 'w') as out_file:
-                out_file.write(json.dumps(requests_json.get(f'{obj_type}s', [])))
+            with open(f'data/{obj_type}/{obj_type}.{page}.json', 'w') \
+                    as out_file:
+                out_file.write(json.dumps(requests_json.get(f'{obj_type}s',
+                                                            [])))
             page += 1
             logging.info(f'Downloaded {page} out of {page_count} pages of {obj_type}s')
         except Exception as e:
