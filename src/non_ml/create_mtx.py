@@ -1,11 +1,12 @@
 import utils
 import numpy as np
 import json
+import sys
 from pathlib import Path
 
 map_file = '././data/maps/nameToId.json'
 folder = "././data/deck/"
-require_side = False
+require_side = True
 print('getting data')
 num_cards, name_lookup, card_to_int, int_to_card = \
     utils.get_card_maps(map_file)
@@ -13,7 +14,6 @@ num_cards, name_lookup, card_to_int, int_to_card = \
 num_cubes = utils.get_num_cubes(folder, require_side=require_side)
 
 print(f'num cubes: {num_cubes}')
-
 cubes = utils.build_decks(folder, num_cubes, num_cards,
                           name_lookup, card_to_int, require_side=require_side)
 

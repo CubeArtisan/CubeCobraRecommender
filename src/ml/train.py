@@ -47,11 +47,12 @@ num_cards, name_lookup, card_to_int, int_to_card = \
 
 num_cubes = utils.get_num_cubes(folder)
 
-with open('cards.json', 'r') as cardsjson:
+with open('cards.json', 'r', encoding="utf-8") as cardsjson:
     cards = json.load(cardsjson)
-    cards = [cards[int_to_card[i]] for i in range(num_cards)]
-    print(cards)
-    sys.exit(0)
+    cards = [cards.get(int_to_card[i], "") for i in range(num_cards)]
+    for card in cards:
+        if "otherParses" in card:
+            del card["otherParses"]
 
 cubes = utils.build_cubes(folder, num_cubes, num_cards, name_lookup,
                           card_to_int)

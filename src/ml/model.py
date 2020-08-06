@@ -18,7 +18,7 @@ Epochs: 100
 
 Batch Size: 64
 """
-
+CARD_EMBEDDING_SIZE = 32
 
 class Encoder(Model):
     """
@@ -56,15 +56,15 @@ class Encoder(Model):
                                                     node_labels)
                     our_children.append(child_index)
                 for index in range(len(structure), len(children)):
-                    our_children.append(-1)
+                    our_children.append(0)
                 our_index = len(node_labels)
                 for index, child_index in enumerate(our_children):
                     if len(children) <= index:
-                        children.append([-1 for _ in node_labels])
+                        children.append([0 for _ in node_labels])
                     if len(children[index]) <= our_index:
-                        children[index].append(-1)
+                        children[index].append(0)
                     else:
-                        children[index][our_index] = -1
+                        children[index][our_index] = 0
                 node_labels.append(vocab)
                 return our_index
             elif isinstance(structure, dict):
@@ -83,11 +83,11 @@ class Encoder(Model):
                 our_index = len(node_labels)
                 for index, child_index in enumerate(our_children):
                     if len(children) <= index:
-                        children.append([-1 for _ in node_labels])
+                        children.append([0 for _ in node_labels])
                     if len(children[index]) <= our_index:
-                        children[index].append(-1)
+                        children[index].append(0)
                     else:
-                        children[index][our_index] = -1
+                        children[index][our_index] = 0
                 node_labels.append(vocab)
                 return our_index
             else:
@@ -101,14 +101,14 @@ class Encoder(Model):
                 node_labels.append(vocab)
                 for index in range(len(children)):
                     if len(children[index]) <= our_index:
-                        children[index].append(-1)
+                        children[index].append(0)
                     else:
-                        children[index][our_index] = -1
+                        children[index][our_index] = 0
                 return our_index
 
         vocab_dict = {}
         children = []
-        node_labels = []
+        node_labels = [0]
         card_indices = []
         for card in cards:
             card_index = convert_structure(card, "", vocab_dict, children,
@@ -116,29 +116,30 @@ class Encoder(Model):
             card_indices.append(card_index)
         children_count = len(children)
         node_count = len(node_labels)
+        print(len(vocab_dict), node_count, children_count)
         children = tf.constant([[child[i] for child in children]
                                 for i in range(len(node_labels))])
         node_labels = tf.constant(node_labels)
         card_indices = tf.constant(card_indices)
-        embedding = tf.Variable(tf.zeros((len(vocab_dict), 64)),
+        embedding = tf.Variable(tf.zeros((len(vocab_dict), CARD_EMBEDDING_SIZE)),
                                 name="vocab_embedding")
-        W = tf.Variable(tf.zeros((len(children) * 64, 64)), name="W")
+        W = tf.Variable(tf.zeros((children_count * CARD_EMBEDDING_SIZE,
+                                  CARD_EMBEDDING_SIZE)), name="W")
         tensor_array = tf.TensorArray(tf.float32, size=0, dynamic_size=True,
                                       clear_after_read=False,
                                       infer_shape=False)
+        tensor_array = tensor_array.write(0, tf.zeros(CARD_EMBEDDING_SIZE))
 
-        def true_cond(_, __):
-            return tf.constant(True)
-
-        def loop_body(tensor_array, i):
+        def loop_cond(_, i):
+            return tf.less(i, tf.squeeze(tf.shape(node_labels)))
+        
+        for i in range(1, node_count):
             node_label = tf.gather(node_labels, i)
             our_children = tf.gather(children, i)
 
-            def get_child_array(i):
+            def get_child_tensor(i):
                 child_index = tf.gather(our_children, i)
-                child_tensor = tf.cond(tf.less(child_index, 0),
-                                       tf.zeros(64),
-                                       tf.gather(tensor_array, child_index))
+                child_tensor = tensor_array.read(child_index)
                 return child_tensor
 
             child_array = tf.concat([get_child_tensor(i)
@@ -146,19 +147,15 @@ class Encoder(Model):
 
             vocab = tf.expand_dims(tf.gather(embedding, node_label), 0)
             node_tensor = tf.nn.relu(tf.add(vocab,
-                                            tf.matmul(child_array.concat(),
-                                                      W)))
+                                            tf.linalg.matvec(W, child_array, transpose_a=True)))
             tensor_array = tensor_array.write(i, node_tensor)
-            i = tf.add(i, 1)
-            return tensor_array, i
+            if i % 1000 == 0:
+                print(f"finished {i}")
 
-        tensor_array, _ = tf.while_loop(true_cond, loop_body,
-                                        [tensor_array, 0],
-                                        parallel_iterations=1,
-                                        maximum_iterations=node_count)
         self.num_cards = len(cards)
         self.card_tensors = tf.gather(tensor_array.concat(), card_indices)
-
+        print("finished preprocessing cards.")
+        
     def call(self, x, training=None):
         def loop_cond(tensor_array, i):
             return tf.less(i, tf.squeeze(tf.shape(x)))
@@ -171,7 +168,7 @@ class Encoder(Model):
             tensor_array = tensor_array.write(row, i)
             i = tf.add(i, 1)
             return tensor_array, i
-
+        print("called encoder.")
         tensor_array = tf.TensorArray(tf.float32, size=0, dynamic_size=True,
                                       clear_after_read=False,
                                       infer_shape=False)
@@ -238,8 +235,7 @@ class CC_Recommender(Model):
     def __init__(self, cards):
         super().__init__()
         self.N = len(cards)
-        self.__preprocess_cards(cards)
-        self.encoder = Encoder("encoder")
+        self.encoder = Encoder("encoder", cards)
         # sigmoid because input is a binary vector we want to reproduce
         self.decoder = Decoder("main", self.N, output_act='sigmoid')
         # softmax because the graph information is probabilities
