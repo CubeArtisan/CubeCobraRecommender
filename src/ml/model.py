@@ -123,31 +123,25 @@ class Encoder(Model):
         card_indices = tf.constant(card_indices)
         embedding = tf.Variable(tf.zeros((len(vocab_dict), CARD_EMBEDDING_SIZE)),
                                 name="vocab_embedding")
-        W = tf.Variable(tf.zeros((children_count * CARD_EMBEDDING_SIZE,
-                                  CARD_EMBEDDING_SIZE)), name="W")
+        W = tf.Variable(tf.zeros((CARD_EMBEDDING_SIZE,
+                                  children_count * CARD_EMBEDDING_SIZE)),
+                                 name="W")
         tensor_array = tf.TensorArray(tf.float32, size=0, dynamic_size=True,
                                       clear_after_read=False,
                                       infer_shape=False)
-        tensor_array = tensor_array.write(0, tf.zeros(CARD_EMBEDDING_SIZE))
-
-        def loop_cond(_, i):
-            return tf.less(i, tf.squeeze(tf.shape(node_labels)))
+        tensor_array = tensor_array.write(0, tf.zeros((1, CARD_EMBEDDING_SIZE)))
         
         for i in range(1, node_count):
             node_label = tf.gather(node_labels, i)
             our_children = tf.gather(children, i)
 
-            def get_child_tensor(i):
-                child_index = tf.gather(our_children, i)
-                child_tensor = tensor_array.read(child_index)
-                return child_tensor
-
-            child_array = tf.concat([get_child_tensor(i)
-                                     for i in range(children_count)], 0)
+            child_array = tf.concat([tensor_array.read(tf.gather(our_children,
+                                                                 i))
+                                     for i in range(children_count)], 1)
 
             vocab = tf.expand_dims(tf.gather(embedding, node_label), 0)
             node_tensor = tf.nn.relu(tf.add(vocab,
-                                            tf.linalg.matvec(W, child_array, transpose_a=True)))
+                                            tf.linalg.matvec(W, child_array)))
             tensor_array = tensor_array.write(i, node_tensor)
             if i % 1000 == 0:
                 print(f"finished {i}")
