@@ -18,7 +18,7 @@ Epochs: 100
 
 Batch Size: 64
 """
-CARD_EMBEDDING_SIZE = 32
+CARD_EMBEDDING_SIZE = 64
 
 class Encoder(Model):
     """

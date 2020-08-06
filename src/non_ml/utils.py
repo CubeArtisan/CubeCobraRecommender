@@ -23,7 +23,8 @@ def exclude(card_file=None):
     for cd in card_dict.values():
         for bf in BAD_FUNCTIONS:
             if bf(cd):
-                BAD_NAMES.append(cd.get['name_lower'])
+                BAD_NAMES.append(cd.get('name_lower'))
+    print(BAD_NAMES)
     return BAD_NAMES
 
 
@@ -65,7 +66,7 @@ def get_num_cubes(cube_folder, require_side=False):
 
 
 def build_cubes(cube_folder, num_cubes, num_cards,
-                name_lookup, card_to_int):
+                card_to_int):
     cubes = np.zeros((num_cubes, num_cards))
     counter = 0
     for f in os.listdir(cube_folder):
@@ -85,7 +86,7 @@ def build_cubes(cube_folder, num_cubes, num_cards,
 
 
 def build_decks(cube_folder, num_cubes, num_cards,
-                name_lookup, card_to_int, require_side=False):
+            card_to_int, require_side=False):
     cubes = np.zeros((num_cubes, num_cards))
     counter = 0
     for f in os.listdir(cube_folder):
