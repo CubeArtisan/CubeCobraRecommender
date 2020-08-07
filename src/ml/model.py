@@ -26,9 +26,11 @@ class Encoder(Model):
     """
     def __init__(self, name, cards, max_cube_size, batch_size):
         super().__init__()
-        self.__preprocess_cards(cards)
+        self.assigned_name = name
         self.max_cube_size = max_cube_size
         self.batch_size = batch_size
+        self.__preprocess_cards(cards)
+        self.flatten = tf.keras.layers.Flatten(name=name + "_flatten")
         # self.input_drop = Dropout(0.2)
         self.encoded_1 = Dense(512, activation='relu', name=name + "_e1")
         # self.e1_drop = Dropout(0.5)
@@ -119,31 +121,32 @@ class Encoder(Model):
         children_count = len(children)
         node_count = len(node_labels)
         print(len(vocab_dict), node_count, children_count)
-        children = tf.constant([[child[i] for child in children]
-                                for i in range(len(node_labels))])
-        node_labels = tf.constant(node_labels)
-        card_indices = tf.constant([0] + card_indices)
-        embedding = tf.Variable(tf.zeros((len(vocab_dict), VOCAB_SIZE)),
-                                name="vocab_embedding")
-        W = tf.Variable(tf.zeros((VOCAB_SIZE,
+        children = [[child[i] for child in children]
+                    for i in range(len(node_labels))]
+        card_indices = [0] + card_indices
+        self.embedding = tf.keras.layers.Embedding(len(vocab_dict), VOCAB_SIZE, input_length=1, name=self.assigned_name + "_vocab_embedding")
+        self.activation = tf.keras.layers.Activation('relu', name=self.assigned_name + '_activation_recursive')
+        self.concat = tf.keras.layers.Concatenate(1, name=self.assigned_name + "_concat_children")
+        self.add = tf.keras.layers.Add(name=self.assigned_name + '_add_recursive')
+        self.W = tf.Variable(tf.zeros((VOCAB_SIZE,
                                   children_count * VOCAB_SIZE)),
-                                 name="W")
+                             name=self.assigned_name + "_W")
+
         tensor_array = tf.TensorArray(tf.float32, size=0, dynamic_size=True,
                                       clear_after_read=False,
                                       infer_shape=False)
         tensor_array = tensor_array.write(0, tf.zeros((1, VOCAB_SIZE)))
         
+        
         for i in range(1, node_count):
-            node_label = tf.gather(node_labels, i)
-            our_children = tf.gather(children, i)
+            node_label = node_labels[i]
+            our_children = children[i]
 
-            child_array = tf.concat([tensor_array.read(tf.gather(our_children,
-                                                                 i))
-                                     for i in range(children_count)], 1)
+            child_array = tf.concat([tensor_array.read(child)
+                                     for child in our_children], 1)
 
-            vocab = tf.expand_dims(tf.gather(embedding, node_label), 0)
-            node_tensor = tf.nn.relu(tf.add(vocab,
-                                            tf.linalg.matvec(W, child_array)))
+            vocab = tf.reshape(self.embedding(node_label), [1, VOCAB_SIZE])
+            node_tensor = self.activation(self.add([vocab, tf.linalg.matvec(self.W, child_array)]))
             tensor_array = tensor_array.write(i, node_tensor)
             if i % 1000 == 0:
                 print(f"finished {i}")
@@ -154,13 +157,9 @@ class Encoder(Model):
         
     def call(self, x, training=None):
         print("called encoder.")
-        print(x.shape, self.max_cube_size)
-        x = tf.concat([tf.reshape(tf.concat([tf.gather(self.card_tensors,
-                                                       tf.gather(tf.gather(x, i), j)) 
-                                             for j in range(self.max_cube_size)], 0), 
-                                            [1,
-                                             self.max_cube_size * VOCAB_SIZE])
-                       for i in range(self.batch_size)], 0)
+        x = tf.nn.embedding_lookup(self.card_tensors, x)
+        print(x.shape)
+        x = self.flatten(x)
         print(x.shape)
         encoded = self.encoded_1(x)
         # encoded = self.e1_drop(encoded)

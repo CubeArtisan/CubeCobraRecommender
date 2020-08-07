@@ -84,7 +84,6 @@ generator = DataGenerator(
     batch_size=batch_size,
     noise=noise,
 )
-generator[0]
 output_dir = f'././ml_files/{name}'
 temp_save_dir = f'{output_dir}/initial_model'
 if Path(temp_save_dir).is_dir():
@@ -106,10 +105,13 @@ else:
     autoencoder.fit(generator, epochs=1)
     Path(temp_save_dir).mkdir(parents=True, exist_ok=True)
     autoencoder.save(temp_save_dir)
+    print("Saved initial model")
 
+print(autoencoder.summary())
+tf.debugging.set_log_device_placement(True)
 
 # pdb.set_trace()
-checkpoint_path = f'{output_dir}/checkpoints/cp-{epoch:04d}.ckpt'
+checkpoint_path = output_dir + '/checkpoints/cp-{epoch:04d}.ckpt'
 checkpoint_dir = os.path.dirname(checkpoint_path)
 Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
 latest_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
