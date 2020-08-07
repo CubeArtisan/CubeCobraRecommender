@@ -68,21 +68,27 @@ def get_num_cubes(cube_folder, require_side=False):
 def build_cubes(cube_folder, num_cubes, num_cards,
                 card_to_int):
     cubes = np.zeros((num_cubes, num_cards))
-    counter = 0
+    cubes = []
     for f in os.listdir(cube_folder):
         full_path = os.path.join(cube_folder, f)
         with open(full_path, 'rb') as fp:
             contents = json.load(fp)
         for cube in contents:
+            if len(cube) == 0 or len(cube) > 850:
+                continue
             card_ids = []
             for card_name in cube:
                 if card_name is not None:
                     card_id = card_to_int.get(card_name)
                     if card_id is not None:
-                        card_ids.append(card_id)
-            cubes[counter, card_ids] = 1
-            counter += 1
-    return cubes
+                        card_ids.append(card_id + 1)
+            if len(card_ids) > 0:
+                cubes.append(card_ids)
+    max_cube_size = max(len(cube) for cube in cubes)
+    print(max_cube_size)
+    for cube in cubes:
+        cube += [0 for _ in range(len(cube), max_cube_size)]
+    return cubes, max_cube_size
 
 
 def build_decks(cube_folder, num_cubes, num_cards,

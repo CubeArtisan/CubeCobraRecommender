@@ -30,7 +30,6 @@ print(f'num decks: {num_decks}')
 
 int_to_card = {v:k for k,v in card_to_int.items()}
 
-print(f'num cubes: {num_cubes}')
 cubes = utils.build_decks(folder, num_decks, num_cards,
                           card_to_int, require_side=require_side)
 

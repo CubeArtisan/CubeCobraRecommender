@@ -1,5 +1,6 @@
 from tensorflow.keras.utils import Sequence
 import numpy as np
+import random
 
 
 class DataGenerator(Sequence):
@@ -8,6 +9,7 @@ class DataGenerator(Sequence):
         self,
         adj_mtx,
         cubes,
+        num_cards,
         batch_size=64,
         shuffle=True,
         to_fit=True,
@@ -24,9 +26,10 @@ class DataGenerator(Sequence):
         self.x_reg = np.zeros_like(adj_mtx)
         np.fill_diagonal(self.x_reg, 1)
         self.x_main = cubes
+        self.max_cube_size = len(cubes[0])
         # initialize other needed inputs
-        self.N_cubes = self.x_main.shape[0]
-        self.N_cards = self.x_main.shape[1]
+        self.N_cubes = len(cubes)
+        self.N_cards = num_cards
         self.reset_indices()
         self.neg_sampler = adj_mtx.sum(0)/adj_mtx.sum()
 
@@ -73,16 +76,18 @@ class DataGenerator(Sequence):
         self.reset_indices()
 
     def generate_data(self, main_indices, reg_indices):
-        cubes = self.x_main[main_indices]
-        x_regularization = self.x_reg[reg_indices]
+        cubes = [self.x_main[i] for i in main_indices]
+        x_regularization = np.zeros((len(reg_indices), self.max_cube_size)).astype(int)        
+        for i, x in enumerate(reg_indices):
+            x_regularization[i,0] = x
         y_regularization = self.y_reg[reg_indices]
+        y_cubes = np.zeros((len(main_indices), self.N_cards))
 
-        cut_mask = np.zeros((self.batch_size, self.N_cards))
-        add_mask = np.zeros((self.batch_size, self.N_cards))
-        y_cut_mask = np.zeros((self.batch_size, self.N_cards))
+        processed_cubes = []
         for i, cube in enumerate(cubes):
-            includes = np.where(cube == 1)[0]
-            excludes = np.where(cube == 0)[0]
+            includes = [x for x in cube if x > 0]
+            excludes = [j - 1 for j in range(1, self.N_cards + 1)
+                          if j not in includes]
             size = len(includes)
             noise = np.clip(
                 np.random.normal(self.noise, self.noise_std),
@@ -90,17 +95,27 @@ class DataGenerator(Sequence):
                 a_max=0.8,
             )
             flip_amount = int(size * noise)
-            flip_include = np.random.choice(includes, flip_amount)
+            random.shuffle(includes)
+            flip_include = includes[:flip_amount]
+            new_cube = [x for x in cube]
+            for to_remove in flip_include:
+                idx = new_cube.index(to_remove)
+                new_cube[idx] = 0
             neg_sampler = self.neg_sampler[excludes] \
                 / self.neg_sampler[excludes].sum()
-            flip_exclude = np.random.choice(excludes, flip_amount,
+            flip_exclude = np.random.choice(excludes,
+                                            min(flip_amount,
+                                                new_cube.count(0)),
                                             p=neg_sampler)
+            for to_add in flip_exclude:
+                idx = new_cube.index(0)
+                new_cube[idx] = to_add + 1
             y_flip_include = np.random.choice(flip_include, flip_amount // 4)
-            cut_mask[i, flip_include] = -1
-            y_cut_mask[i, y_flip_include] = -1
-            add_mask[i, flip_exclude] = 1
+            random.shuffle(new_cube)
+            for idx in cube:
+                if idx > 0 and idx not in y_flip_include:
+                    y_cubes[i, idx - 1] = 1
+            processed_cubes.append(new_cube)
 
-        x_cubes = cubes + cut_mask + add_mask
-        y_cubes = cubes + y_cut_mask
-
+        x_cubes = np.array(processed_cubes).astype(int)
         return [(x_cubes, x_regularization), (y_cubes, y_regularization)]

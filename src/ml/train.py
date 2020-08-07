@@ -15,11 +15,7 @@ if __name__ == "__main__":
 from generator import DataGenerator
 from model import CC_Recommender
 from non_ml import utils
-<<<<<<< HEAD
-import json
-=======
 
->>>>>>> 514d3b46b0b628911b2c7574bab516fa0b835287
 
 def reset_random_seeds(seed):
     # currently not used
@@ -42,7 +38,7 @@ if len(args) == 6:
     reset_random_seeds(seed)
 
 map_file = '././data/maps/nameToId.json'
-folder = "././data/cubes/"
+folder = "././data/cube/"
 
 print('Loading Cube Data . . .\n')
 
@@ -53,15 +49,8 @@ card_to_int = {v:k for k,v in int_to_card.items()}
 num_cubes = utils.get_num_cubes(folder)
 num_cards = len(int_to_card)
 
-with open('cards.json', 'r', encoding="utf-8") as cardsjson:
-    cards = json.load(cardsjson)
-    cards = [cards.get(int_to_card[i], "") for i in range(num_cards)]
-    for card in cards:
-        if "otherParses" in card:
-            del card["otherParses"]
-
-cubes = utils.build_cubes(folder, num_cubes, num_cards,
-                          card_to_int)
+cubes, max_cube_size = utils.build_cubes(folder, num_cubes,
+                                         num_cards, card_to_int)
 
 print('Loading Adjacency Matrix . . .\n')
 
@@ -79,8 +68,7 @@ print('Creating Graph for Regularization . . . \n')
 # y_mtx = np.nan_to_num(y_mtx,0)
 # y_mtx[np.where(y_mtx.sum(1) == 0),np.where(y_mtx.sum(1) == 0)] = 1
 
-# y_mtx = adj_mtx.copy()
-# np.fill_diagonal(y_mtx, 1)
+y_mtx = (adj_mtx/adj_mtx.sum(1)[:, None])
 
 print('Setting Up Data for Training . . .\n')
 
@@ -89,29 +77,54 @@ print('Setting Up Data for Training . . .\n')
 # np.fill_diagonal(x_items,1)
 
 print('Setting Up Model . . . \n')
-
-autoencoder = CC_Recommender(cards)
-autoencoder.compile(
-    optimizer='adam',
-    loss=['binary_crossentropy', 'kullback_leibler_divergence'],
-    loss_weights=[1.0, reg],
-    metrics=['accuracy'],
-)
-
 generator = DataGenerator(
     y_mtx,
     cubes,
+    num_cards,
     batch_size=batch_size,
     noise=noise,
 )
+generator[0]
+output_dir = f'././ml_files/{name}'
+temp_save_dir = f'{output_dir}/initial_model'
+if Path(temp_save_dir).is_dir():
+    autoencoder = tf.keras.models.load_model(temp_save_dir)
+else:
+    with open('cards.json', 'r', encoding="utf-8") as cardsjson:
+        cards = json.load(cardsjson)
+        cards = [cards.get(int_to_card[i], "") for i in range(num_cards)]
+        for card in cards:
+            if "otherParses" in card:
+                del card["otherParses"]
+    autoencoder = CC_Recommender(cards, max_cube_size, batch_size)
+    autoencoder.compile(
+        optimizer='adam',
+        loss=['binary_crossentropy', 'kullback_leibler_divergence'],
+        loss_weights=[1.0, reg],
+        metrics=['accuracy'],
+    )
+    autoencoder.fit(generator, epochs=1)
+    Path(temp_save_dir).mkdir(parents=True, exist_ok=True)
+    autoencoder.save(temp_save_dir)
+
 
 # pdb.set_trace()
-
+checkpoint_path = f'{output_dir}/checkpoints/cp-{epoch:04d}.ckpt'
+checkpoint_dir = os.path.dirname(checkpoint_path)
+Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+latest_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
+if latest_checkpoint is not None:
+    autoencoder.load_weights(latest)
+cp_callback = tf.keras.callbacks.ModelCheckpoint(
+    filepath=checkpoint_path, 
+    verbose=1, 
+    save_weights_only=True,
+    period=5)
 autoencoder.fit(
     generator,
     epochs=epochs,
+    callbacks=[cp_callback]
 )
 
-output_dir = f'././ml_files/{name}'
 Path(output_dir).mkdir(parents=True, exist_ok=True)
 autoencoder.save(output_dir, save_format='tf')

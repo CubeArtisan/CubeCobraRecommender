@@ -18,15 +18,17 @@ Epochs: 100
 
 Batch Size: 64
 """
-CARD_EMBEDDING_SIZE = 64
+VOCAB_SIZE = 8
 
 class Encoder(Model):
     """
     Encoder part of the model -> compress dimensionality
     """
-    def __init__(self, name, cards):
+    def __init__(self, name, cards, max_cube_size, batch_size):
         super().__init__()
         self.__preprocess_cards(cards)
+        self.max_cube_size = max_cube_size
+        self.batch_size = batch_size
         # self.input_drop = Dropout(0.2)
         self.encoded_1 = Dense(512, activation='relu', name=name + "_e1")
         # self.e1_drop = Dropout(0.5)
@@ -120,16 +122,16 @@ class Encoder(Model):
         children = tf.constant([[child[i] for child in children]
                                 for i in range(len(node_labels))])
         node_labels = tf.constant(node_labels)
-        card_indices = tf.constant(card_indices)
-        embedding = tf.Variable(tf.zeros((len(vocab_dict), CARD_EMBEDDING_SIZE)),
+        card_indices = tf.constant([0] + card_indices)
+        embedding = tf.Variable(tf.zeros((len(vocab_dict), VOCAB_SIZE)),
                                 name="vocab_embedding")
-        W = tf.Variable(tf.zeros((CARD_EMBEDDING_SIZE,
-                                  children_count * CARD_EMBEDDING_SIZE)),
+        W = tf.Variable(tf.zeros((VOCAB_SIZE,
+                                  children_count * VOCAB_SIZE)),
                                  name="W")
         tensor_array = tf.TensorArray(tf.float32, size=0, dynamic_size=True,
                                       clear_after_read=False,
                                       infer_shape=False)
-        tensor_array = tensor_array.write(0, tf.zeros((1, CARD_EMBEDDING_SIZE)))
+        tensor_array = tensor_array.write(0, tf.zeros((1, VOCAB_SIZE)))
         
         for i in range(1, node_count):
             node_label = tf.gather(node_labels, i)
@@ -151,25 +153,15 @@ class Encoder(Model):
         print("finished preprocessing cards.")
         
     def call(self, x, training=None):
-        def loop_cond(tensor_array, i):
-            return tf.less(i, tf.squeeze(tf.shape(x)))
-
-        def loop_body(tensor_array, i):
-            original_row = tf.gather(x, i)
-            row = tf.concat([tf.multiply(tf.gather(original_row, j),
-                                         tf.gather(self.card_tensors, j))
-                             for j in range(self.num_cards)], 0)
-            tensor_array = tensor_array.write(row, i)
-            i = tf.add(i, 1)
-            return tensor_array, i
         print("called encoder.")
-        tensor_array = tf.TensorArray(tf.float32, size=0, dynamic_size=True,
-                                      clear_after_read=False,
-                                      infer_shape=False)
-        tensor_array, _ = tf.while_loop(loop_cond, loop_body,
-                                        [tensor_array, 0],
-                                        parallel_iterations=1)
-        x = tensor_array.concat()
+        print(x.shape, self.max_cube_size)
+        x = tf.concat([tf.reshape(tf.concat([tf.gather(self.card_tensors,
+                                                       tf.gather(tf.gather(x, i), j)) 
+                                             for j in range(self.max_cube_size)], 0), 
+                                            [1,
+                                             self.max_cube_size * VOCAB_SIZE])
+                       for i in range(self.batch_size)], 0)
+        print(x.shape)
         encoded = self.encoded_1(x)
         # encoded = self.e1_drop(encoded)
         encoded = self.encoded_2(encoded)
@@ -226,10 +218,10 @@ class CC_Recommender(Model):
         If our input is a binary vector where 1 represents the presence of an
         item in a collection, then an autoencoder trained
     """
-    def __init__(self, cards):
+    def __init__(self, cards, max_cube_size, batch_size):
         super().__init__()
         self.N = len(cards)
-        self.encoder = Encoder("encoder", cards)
+        self.encoder = Encoder("encoder", cards, max_cube_size, batch_size)
         # sigmoid because input is a binary vector we want to reproduce
         self.decoder = Decoder("main", self.N, output_act='sigmoid')
         # softmax because the graph information is probabilities
