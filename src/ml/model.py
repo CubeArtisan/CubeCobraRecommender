@@ -1,4 +1,4 @@
-from typing import Dict, List, Union
+from typing import Dict, List, Tuple, Union
 
 import tensorflow as tf
 from tensorflow.keras.layers import Dense
@@ -18,7 +18,7 @@ Epochs: 100
 
 Batch Size: 64
 """
-VOCAB_SIZE = 8
+VOCAB_SIZE = 4
 
 class Encoder(Model):
     """
@@ -45,7 +45,8 @@ class Encoder(Model):
         def convert_structure(structure: Union[list, dict, int, str, bool],
                               key: str, vocab_dict: Dict[str, int],
                               children: List[List[int]],
-                              node_labels: List[int]) -> int:
+                              node_labels: List[int],
+                              node_depths: List[int]) -> Tuple[int, int]:
 
             if isinstance(structure, list):
                 if key in vocab_dict:
@@ -54,11 +55,13 @@ class Encoder(Model):
                     vocab = len(vocab_dict)
                     vocab_dict[key] = vocab
                 our_children = []
+                max_child_depth = 0
                 for index, child in enumerate(structure):
-                    child_index = convert_structure(child, str(index),
-                                                    vocab_dict, children,
-                                                    node_labels)
+                    child_index, depth = convert_structure(child, str(index),
+                                                           vocab_dict, children,
+                                                           node_labels, node_depths)
                     our_children.append(child_index)
+                    max_child_depth = max(max_child_depth, depth)
                 for index in range(len(structure), len(children)):
                     our_children.append(0)
                 our_index = len(node_labels)
@@ -70,7 +73,8 @@ class Encoder(Model):
                     else:
                         children[index][our_index] = 0
                 node_labels.append(vocab)
-                return our_index
+                node_depths.append(max_child_depth + 1)
+                return our_index, max_child_depth + 1
             elif isinstance(structure, dict):
                 our_children = []
                 if key in vocab_dict:
@@ -78,10 +82,12 @@ class Encoder(Model):
                 else:
                     vocab = len(vocab_dict)
                     vocab_dict[key] = vocab
+                max_child_depth = 0
                 for key, child in structure.items():
-                    child_index = convert_structure(child, key, vocab_dict,
-                                                    children, node_labels)
+                    child_index, depth = convert_structure(child, key, vocab_dict,
+                                                    children, node_labels, node_depths)
                     our_children.append(child_index)
+                    max_child_depth = max(max_child_depth, depth)
                 for _ in range(len(structure), len(children)):
                     our_children.append(-1)
                 our_index = len(node_labels)
@@ -93,7 +99,8 @@ class Encoder(Model):
                     else:
                         children[index][our_index] = 0
                 node_labels.append(vocab)
-                return our_index
+                node_depths.append(max_child_depth + 1)
+                return our_index, max_child_depth + 1
             else:
                 key = f'{key}.{structure}'
                 if key in vocab_dict:
@@ -103,56 +110,75 @@ class Encoder(Model):
                     vocab_dict[key] = vocab
                 our_index = len(node_labels)
                 node_labels.append(vocab)
+                node_depths.append(0)
                 for index in range(len(children)):
                     if len(children[index]) <= our_index:
                         children[index].append(0)
                     else:
                         children[index][our_index] = 0
-                return our_index
+                return our_index, 0
 
         vocab_dict = {}
         children = []
         node_labels = [0]
         card_indices = []
+        node_depths = [-1]
         for card in cards:
-            card_index = convert_structure(card, "", vocab_dict, children,
-                                           node_labels)
+            card_index, _ = convert_structure(card, "", vocab_dict, children,
+                                              node_labels, node_depths)
             card_indices.append(card_index)
         children_count = len(children)
         node_count = len(node_labels)
         print(len(vocab_dict), node_count, children_count)
-        children = [[child[i] for child in children]
-                    for i in range(len(node_labels))]
+        children = tf.constant([[child[i] for child in children]
+                                for i in range(len(node_labels))])
+        node_labels = tf.constant(node_labels)
         card_indices = [0] + card_indices
-        self.embedding = tf.keras.layers.Embedding(len(vocab_dict), VOCAB_SIZE, input_length=1, name=self.assigned_name + "_vocab_embedding")
-        self.activation = tf.keras.layers.Activation('relu', name=self.assigned_name + '_activation_recursive')
+        self.embedding = tf.keras.layers.Embedding(len(vocab_dict), VOCAB_SIZE, input_length=1,
+                                                   name=self.assigned_name + "_vocab_embedding")
+        self.activation = tf.keras.layers.Activation('relu',
+                                                     name=self.assigned_name + '_activation_recursive')
         self.concat = tf.keras.layers.Concatenate(1, name=self.assigned_name + "_concat_children")
         self.add = tf.keras.layers.Add(name=self.assigned_name + '_add_recursive')
-        self.W = tf.Variable(tf.zeros((VOCAB_SIZE,
-                                  children_count * VOCAB_SIZE)),
-                             name=self.assigned_name + "_W")
+        self.W = tf.Variable(name=self.assigned_name + "_W",
+                             initial_value=tf.keras.initializers.glorot_uniform()(shape=(VOCAB_SIZE, children_count * VOCAB_SIZE)))
 
-        tensor_array = tf.TensorArray(tf.float32, size=0, dynamic_size=True,
-                                      clear_after_read=False,
-                                      infer_shape=False)
+        node_depths = tf.constant(node_depths)
+        max_depth = max(node_depths)
+        tensor_array = tf.TensorArray(tf.float32, size=node_count, clear_after_read=False,
+                                      infer_shape=True)
+
+        def loop_cond(_, i):
+            return tf.less(i, max_depth + 1)
+
+        def loop_body(tensor_array, i):
+            idxs = tf.where(tf.math.equal(node_depths, i))
+
+            def inner_loop_cond(_, j):
+                return tf.less(j, tf.gather(tf.shape(idxs), 0))
+
+            def inner_loop_body(tensor_array, j):
+                idx = tf.squeeze(tf.gather(idxs, j))
+                node_label = tf.gather(node_labels, idx)
+                our_children = tf.gather(children, idx)
+                child_array = tf.concat([tensor_array.read(tf.squeeze(tf.gather(our_children, k)))
+                                         for k in range(children_count)], 1)
+                vocab = tf.reshape(self.embedding(node_label), [1, VOCAB_SIZE])
+                node_tensor = self.activation(self.add([vocab,
+                                                        tf.linalg.matvec(self.W, child_array)]))
+                tensor_array = tensor_array.write(idx, node_tensor)
+                return tensor_array, j + 1
+
+            tensor_array, _ = tf.while_loop(inner_loop_cond, inner_loop_body,
+                                            loop_vars=[tensor_array, 0], parallel_iterations=10000)
+
+            return tensor_array, i + 1
+
         tensor_array = tensor_array.write(0, tf.zeros((1, VOCAB_SIZE)))
-        
-        
-        for i in range(1, node_count):
-            node_label = node_labels[i]
-            our_children = children[i]
-
-            child_array = tf.concat([tensor_array.read(child)
-                                     for child in our_children], 1)
-
-            vocab = tf.reshape(self.embedding(node_label), [1, VOCAB_SIZE])
-            node_tensor = self.activation(self.add([vocab, tf.linalg.matvec(self.W, child_array)]))
-            tensor_array = tensor_array.write(i, node_tensor)
-            if i % 1000 == 0:
-                print(f"finished {i}")
-
+        tensor_array, _ = tf.while_loop(loop_cond, loop_body, loop_vars=[tensor_array, 0],
+                                        parallel_iterations=1)
         self.num_cards = len(cards)
-        self.card_tensors = tf.gather(tensor_array.concat(), card_indices)
+        self.card_tensors = tf.concat([tensor_array.read(i) for i in card_indices], 0)
         print("finished preprocessing cards.")
         
     def call(self, x, training=None):

@@ -121,7 +121,7 @@ cp_callback = tf.keras.callbacks.ModelCheckpoint(
     filepath=checkpoint_path, 
     verbose=1, 
     save_weights_only=True,
-    period=5)
+    period=1)
 autoencoder.fit(
     generator,
     epochs=epochs,
