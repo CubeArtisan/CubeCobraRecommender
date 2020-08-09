@@ -7,7 +7,7 @@ import os
 
 map_file = '././data/maps/nameToId.json'
 folder = "././data/deck/"
-require_side = True
+require_side = False
 print('getting data')
 num_cards = 0
 num_decks = 0

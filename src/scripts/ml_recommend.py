@@ -5,8 +5,15 @@ from tensorflow.keras.models import load_model
 import sys
 import urllib.request
 
+if __name__ == "__main__":
+    from os.path import dirname as dir
+    sys.path.append(dir(sys.path[0]))
+
+import non_ml.utils as utils
+
 args = sys.argv[1:]
 cube_name = args[0]
+
 non_json = True
 root = "https://cubecobra.com"
 if len(args) > 1:
@@ -16,6 +23,7 @@ if len(args) > 1:
         non_json = False
 else:
     amount = 100
+folder = "././data/cube/"
 
 print('Getting Cube List . . . \n')
 
@@ -34,7 +42,11 @@ print ('Loading Card Name Lookup . . . \n')
 int_to_card = json.load(open('ml_files/recommender_id_map.json','rb'))
 int_to_card = {int(k):v for k,v in int_to_card.items()}
 card_to_int = {v:k for k,v in int_to_card.items()}
+num_cubes = utils.get_num_cubes(folder)
+num_cards = len(int_to_card)
 
+_, max_cube_size = utils.build_cubes(folder, num_cubes,
+                                     num_cards, card_to_int)
 num_cards = len(int_to_card)
 
 print ('Creating Cube Vector . . . \n')
@@ -44,14 +56,13 @@ for name in card_names:
     idx = card_to_int.get(unidecode.unidecode(name.lower()))
     #skip unknown cards (e.g. custom cards)
     if idx is not None:
-        cube_indices.append(idx)
-
-cube = np.zeros(num_cards)
-cube[cube_indices] = 1
+        cube_indices.append(idx + 1)
+cube_indices += [0 for _ in range(len(cube_indices), max_cube_size)]
+cube = np.array(cube_indices)
 
 print('Loading Model . . . \n')
 
-model = load_model('ml_files/neg')
+model = load_model('ml_files/recommender7')
 
 # def encode(model,data):
 #     return model.encoder.bottleneck(
@@ -75,14 +86,14 @@ model = load_model('ml_files/neg')
 #         )
 #     )
 
-def recommend(model,data):
-    encoded = model.encoder(data,training=False)
-    return model.decoder(encoded,training=False)
+def recommend(model, data):
+    encoded = model.encoder(data, training=False)
+    return model.decoder(encoded, training=False)
 
 print ('Generating Recommendations . . . \n')
 
-cube = np.array(cube,dtype=float).reshape(1,num_cards)
-results = recommend(model,cube)[0].numpy()
+cube = np.array(cube, dtype=int).reshape(1, max_cube_size)
+results = recommend(model, cube)[0].numpy()
 
 ranked = results.argsort()[::-1]
 
@@ -93,7 +104,7 @@ output = {
 
 recommended = 0
 for rec in ranked:
-    if cube[0][rec] != 1:
+    if rec + 1 not in cube_indices:
         card = int_to_card[rec]
         if non_json:
             print(card)
@@ -104,8 +115,9 @@ for rec in ranked:
             break
 
 for idx in cube_indices:
-    card = int_to_card[idx]
-    output['cuts'][card] = results[idx].item()
+    if idx > 0:
+        card = int_to_card[idx - 1]
+        output['cuts'][card] = results[idx - 1].item()
 
 if non_json:
     cards = list(output['cuts'].keys())

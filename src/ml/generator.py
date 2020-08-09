@@ -1,3 +1,7 @@
+from collections import Counter
+from multiprocessing import Queue
+from multiprocessing.pool import Pool
+
 from tensorflow.keras.utils import Sequence
 import numpy as np
 import random
@@ -30,8 +34,19 @@ class DataGenerator(Sequence):
         # initialize other needed inputs
         self.N_cubes = len(cubes)
         self.N_cards = num_cards
-        self.reset_indices()
         self.neg_sampler = adj_mtx.sum(0)/adj_mtx.sum()
+        self.cube_includes = [[x for x in cube if x > 0] for cube in cubes]
+        self.cube_includes_set = [set(includes) for includes in self.cube_includes]
+        self.cube_excludes = [[x - 1 for x in range(1, self.N_cards + 1) if x not in includes_set]
+                              for includes_set in self.cube_includes_set]
+        del self.cube_includes_set
+        self.neg_samplers = [self.neg_sampler[excludes]
+                             / self.neg_sampler[excludes].sum()
+                             for excludes in self.cube_excludes]
+        self.pool = Pool(30)
+        self.indices = np.arange(self.N_cubes)
+        self.batches = []
+        self.reset_indices()
 
     def __len__(self):
         """
@@ -39,7 +54,7 @@ class DataGenerator(Sequence):
         """
         return self.N_cubes // self.batch_size
 
-    def __getitem__(self, batch_number):
+    def __getitem(self, batch_number):
         """
         Generates a data mini-batch
         param batch_number: which batch to generate
@@ -58,16 +73,23 @@ class DataGenerator(Sequence):
             main_indices,
             reg_indices,
         )
-
         if self.to_fit:
             return [X[0], X[1]], [y[0], y[1]]
         else:
             return [X[0], X[1]]
 
+    def __getitem__(self, batch_number):
+        return self.__getitem(batch_number)
+        # return self.batches[batch_number].get()
+
     def reset_indices(self):
         self.indices = np.arange(self.N_cubes)
         if self.shuffle:
             np.random.shuffle(self.indices)
+        # print('starting to calculate batches')
+        # self.batches = [self.pool.apply_async(self.__getitem, (i,))
+        #                 for i in range(len(self))]
+        # print('started calculating batches')
 
     def on_epoch_end(self):
         """
@@ -77,17 +99,18 @@ class DataGenerator(Sequence):
 
     def generate_data(self, main_indices, reg_indices):
         cubes = [self.x_main[i] for i in main_indices]
+        cube_includes = [self.cube_includes[i] for i in main_indices]
+        cube_excludes = [self.cube_excludes[i] for i in main_indices]
+        neg_samplers = [self.neg_samplers[i] for i in main_indices]
         x_regularization = np.zeros((len(reg_indices), self.max_cube_size)).astype(int)        
         for i, x in enumerate(reg_indices):
-            x_regularization[i,0] = x
+            x_regularization[i, 0] = x
         y_regularization = self.y_reg[reg_indices]
         y_cubes = np.zeros((len(main_indices), self.N_cards))
 
         processed_cubes = []
-        for i, cube in enumerate(cubes):
-            includes = [x for x in cube if x > 0]
-            excludes = [j - 1 for j in range(1, self.N_cards + 1)
-                          if j not in includes]
+        for i, cube, includes, excludes, neg_sampler \
+            in zip(range(len(cubes)), cubes, cube_includes, cube_excludes, neg_samplers):
             size = len(includes)
             noise = np.clip(
                 np.random.normal(self.noise, self.noise_std),
@@ -95,27 +118,25 @@ class DataGenerator(Sequence):
                 a_max=0.8,
             )
             flip_amount = int(size * noise)
-            random.shuffle(includes)
-            flip_include = includes[:flip_amount]
-            new_cube = [x for x in cube]
+            flip_include = np.random.choice(includes, flip_amount, replace=False)
+            new_cube = Counter(cube)
             for to_remove in flip_include:
-                idx = new_cube.index(to_remove)
-                new_cube[idx] = 0
-            neg_sampler = self.neg_sampler[excludes] \
-                / self.neg_sampler[excludes].sum()
+                new_cube[to_remove] -= 1
             flip_exclude = np.random.choice(excludes,
-                                            min(flip_amount,
-                                                new_cube.count(0)),
-                                            p=neg_sampler)
+                                            flip_amount,
+                                            p=neg_sampler,
+                                            replace=False)
             for to_add in flip_exclude:
-                idx = new_cube.index(0)
-                new_cube[idx] = to_add + 1
+                new_cube[to_add + 1] += 1
             y_flip_include = np.random.choice(flip_include, flip_amount // 4)
-            random.shuffle(new_cube)
+            actual_cube = []
+            for key, count in new_cube.items():
+                actual_cube += [key for _ in range(count)]
+            random.shuffle(actual_cube)
             for idx in cube:
                 if idx > 0 and idx not in y_flip_include:
                     y_cubes[i, idx - 1] = 1
-            processed_cubes.append(new_cube)
+            processed_cubes.append(actual_cube)
 
         x_cubes = np.array(processed_cubes).astype(int)
         return [(x_cubes, x_regularization), (y_cubes, y_regularization)]

@@ -92,7 +92,7 @@ def build_cubes(cube_folder, num_cubes, num_cards,
 
 
 def build_decks(cube_folder, num_cubes, num_cards,
-            card_to_int, require_side=False):
+                card_to_int, require_side=False):
     cubes = np.zeros((num_cubes, num_cards))
     counter = 0
     for f in os.listdir(cube_folder):
