@@ -20,10 +20,66 @@ Epochs: 100
 
 Batch Size: 64
 """
-EMBED_SIZE = 64
 VOCAB_SIZE = 8
-PATH_COUNT = 32
-RNN_SIZE = 32
+PATH_COUNT = 8
+RNN_SIZE = 4
+EMBED_SIZE = 64
+
+
+def convert_structure(structure: Union[list, dict, int, str, bool],
+                      key: str, vocab_dict: Dict[str, int],
+                      children: List[List[int]],
+                      node_labels: List[int],
+                      node_heights: List[int],
+                      node_depths: List[int],
+                      depth: int) -> Tuple[int, int]:
+    our_children = []
+    max_child_height = 0
+    if isinstance(structure, list):
+        for index, child in enumerate(structure):
+            child_index, height = convert_structure(child, str(index),
+                                                    vocab_dict, children,
+                                                    node_labels, node_heights,
+                                                    node_depths, depth + 1)
+            our_children.append(child_index)
+            max_child_height = max(max_child_height, height)
+    elif isinstance(structure, dict):
+        for key, child in structure.items():
+            child_index, height = convert_structure(child, key, vocab_dict,
+                                                    children, node_labels, node_heights,
+                                                    node_depths, depth + 1)
+            our_children.append(child_index)
+            max_child_height = max(max_child_height, height)
+    else:
+        key = f'{key}.{structure}'
+        if key in vocab_dict:
+            vocab = vocab_dict[key]
+        else:
+            vocab = len(vocab_dict)
+            vocab_dict[key] = vocab
+        our_index = len(node_labels)
+        node_labels.append(vocab)
+        node_heights.append(0)
+        for index in range(len(children)):
+            children[index].append(0)
+        node_depths.append(depth)
+        return our_index, 0
+    if key in vocab_dict:
+        vocab = vocab_dict[key]
+    else:
+        vocab = len(vocab_dict)
+        vocab_dict[key] = vocab
+    for _ in range(len(structure), len(children)):
+        our_children.append(-1)
+    our_index = len(node_labels)
+    for index, child_index in enumerate(our_children):
+        if len(children) <= index:
+            children.append([0 for _ in node_labels])
+        children[index].append(0)
+    node_labels.append(vocab)
+    node_heights.append(max_child_height + 1)
+    node_depths.append(depth)
+    return our_index, max_child_height + 1
 
 
 class Encoder(Model):
@@ -38,73 +94,16 @@ class Encoder(Model):
         self.flatten = tf.keras.layers.Flatten(name=name + "_flatten")
         self.__preprocess_cards(cards)
         # self.input_drop = Dropout(0.2)
-        self.encoded_1 = Dense(512, activation='relu', name=name + "_e1")
+        self.encoded_1 = Dense(EMBED_SIZE * 8, activation='relu', name=name + "_e1")
         # self.e1_drop = Dropout(0.5)
-        self.encoded_2 = Dense(256, activation='relu', name=name + "_e2")
+        self.encoded_2 = Dense(EMBED_SIZE * 4, activation='relu', name=name + "_e2")
         # self.e2_drop = Dropout(0.5)
-        self.encoded_3 = Dense(128, activation='relu', name=name + "_e3")
+        self.encoded_3 = Dense(EMBED_SIZE * 2, activation='relu', name=name + "_e3")
         # self.e3_drop = Dropout(0.2)
-        self.bottleneck = Dense(64, activation='relu',
+        self.bottleneck = Dense(EMBED_SIZE, activation='relu',
                                 name=name + "_bottleneck")
 
     def __preprocess_cards(self, cards):
-        self.card_tensors = tf.keras.layers.Embedding(len(cards) + 1, EMBED_SIZE)
-        return
-        def convert_structure(structure: Union[list, dict, int, str, bool],
-                              key: str, vocab_dict: Dict[str, int],
-                              children: List[List[int]],
-                              node_labels: List[int],
-                              node_heights: List[int],
-                              node_depths: List[int],
-                              depth: int) -> Tuple[int, int]:
-            our_children = []
-            max_child_height = 0
-            if isinstance(structure, list):
-                for index, child in enumerate(structure):
-                    child_index, height = convert_structure(child, str(index),
-                                                            vocab_dict, children,
-                                                            node_labels, node_heights,
-                                                            node_depths, depth + 1)
-                    our_children.append(child_index)
-                    max_child_height = max(max_child_height, height)
-            elif isinstance(structure, dict):
-                for key, child in structure.items():
-                    child_index, height = convert_structure(child, key, vocab_dict,
-                                                            children, node_labels, node_heights,
-                                                            node_depths, depth + 1)
-                    our_children.append(child_index)
-                    max_child_height = max(max_child_height, height)
-            else:
-                key = f'{key}.{structure}'
-                if key in vocab_dict:
-                    vocab = vocab_dict[key]
-                else:
-                    vocab = len(vocab_dict)
-                    vocab_dict[key] = vocab
-                our_index = len(node_labels)
-                node_labels.append(vocab)
-                node_heights.append(0)
-                for index in range(len(children)):
-                    children[index].append(0)
-                node_depths.append(depth)
-                return our_index, 0
-            if key in vocab_dict:
-                vocab = vocab_dict[key]
-            else:
-                vocab = len(vocab_dict)
-                vocab_dict[key] = vocab
-            for _ in range(len(structure), len(children)):
-                our_children.append(-1)
-            our_index = len(node_labels)
-            for index, child_index in enumerate(our_children):
-                if len(children) <= index:
-                    children.append([0 for _ in node_labels])
-                children[index].append(0)
-            node_labels.append(vocab)
-            node_heights.append(max_child_height + 1)
-            node_depths.append(depth)
-            return our_index, max_child_height + 1
-
         vocab_dict = {"": 0}
         children = []
         node_labels = [0]
@@ -181,10 +180,11 @@ class Encoder(Model):
                 node_paths.append([0 for _ in range(max_path_length)])
                 our_path_lengths.append(0)
             path_lengths.append(our_path_lengths)
-
-        all_paths = tf.constant(all_paths)
-        path_lengths = tf.constant(path_lengths)
-        print(tf.shape(all_paths), tf.shape(path_lengths))
+        print('paths', max_paths, max_path_length)
+        self.max_paths = max_paths
+        self.max_path_length = max_path_length
+        self.all_paths = tf.constant(all_paths)
+        self.path_lengths = tf.constant(path_lengths)
         self.embedding = tf.keras.layers.Embedding(len(vocab_dict), VOCAB_SIZE,
                                                    name=self.assigned_name + "_vocab_embedding")
         rnn_cell_fw = tf.keras.layers.LSTMCell(RNN_SIZE // 2)
@@ -198,32 +198,27 @@ class Encoder(Model):
             dtype=tf.float32)
         # rnn_cell = tf.keras.layers.LSTMCell(RNN_SIZE)
         # self.rnn = tf.keras.layers.RNN(rnn_cell, dtype=tf.float32, return_state=True)
-        self.embed_dense_layer = tf.keras.layers.Dense(units=EMBED_SIZE,
-                                                       activation=tf.nn.tanh, use_bias=False)
+        print('preprocessed cards')
 
-        all_path_embed = self.embedding(all_paths, training=True)
-        flat_paths = tf.reshape(all_path_embed, shape=[-1, max_path_length, VOCAB_SIZE])
+    def call(self, x, training=False, mask=None):
+        all_paths = tf.nn.embedding_lookup(self.all_paths, x)
+        all_path_embed = self.embedding(all_paths) # batch_size, max_cube_size, VOCAB_SIZE
+        flat_paths = tf.reshape(all_path_embed, shape=[-1, self.max_path_length, VOCAB_SIZE])
+        path_lengths = tf.nn.embedding_lookup(self.path_lengths, x)
         flat_valid_contexts_mask = tf.expand_dims(tf.sequence_mask(tf.reshape(path_lengths, [-1]),
-                                                                   maxlen=max_path_length,
+                                                                   maxlen=self.max_path_length,
                                                                    dtype=tf.float32), axis=-1)
         _, state_fw, _, state_bw, _ = self.rnn(inputs=flat_paths, mask=flat_valid_contexts_mask,
-                                               training=True)
+                                               training=training)
         final_rnn_state = tf.concat([state_fw, state_bw], -1)
 
         # _, final_rnn_state, _ = self.rnn(inputs=flat_paths, mask=flat_valid_contexts_mask,
-        #                                  training=True)
-        path_nodes_aggregation = tf.reshape(final_rnn_state, [-1, max_paths * RNN_SIZE])
-        self.card_tensors = self.embed_dense_layer(inputs=path_nodes_aggregation)
-        print(tf.shape(self.card_tensors))
-        self.num_cards = len(cards)
-        print("finished preprocessing cards.")
-        
-    def call(self, x, **kwargs):
-        print("called encoder.")
-        # x = self.card_tensors(x)
-        # x = tf.nn.embedding_lookup(self.card_tensors, x)
-        print(x.shape)
-        # x = self.flatten(x)
+        #                                  training=training)
+        print(tf.shape(final_rnn_state))
+        x = tf.reshape(final_rnn_state, [-1, self.max_cube_size * self.max_paths * RNN_SIZE])
+        # x = self.dropout(path_nodes_aggregation, training=training)
+        # x = self.embed_dense_layer(inputs=path_nodes_aggregation)
+        print('finished processing cards')
         print(x.shape)
         encoded = self.encoded_1(x)
         # encoded = self.e1_drop(encoded)
@@ -248,11 +243,11 @@ class Decoder(Model):
     def __init__(self, name, output_dim, output_act):
         super().__init__()
         # self.bottleneck_drop = Dropout(0.2)
-        self.decoded_1 = Dense(128, activation='relu', name=name + "_d1")
+        self.decoded_1 = Dense(EMBED_SIZE * 2, activation='relu', name=name + "_d1")
         # self.d1_drop = Dropout(0.4)
-        self.decoded_2 = Dense(256, activation='relu', name=name + "_d2")
+        self.decoded_2 = Dense(EMBED_SIZE * 4, activation='relu', name=name + "_d2")
         # self.d2_drop = Dropout(0.4)
-        self.decoded_3 = Dense(512, activation='relu', name=name + "_d3")
+        self.decoded_3 = Dense(EMBED_SIZE * 8, activation='relu', name=name + "_d3")
         # self.d3_drop = Dropout(0.2)
         self.reconstruct = Dense(output_dim, activation=output_act,
                                  name=name + "_reconstruction")
@@ -312,6 +307,7 @@ class CC_Recommender(Model):
         x, identity = input
         # x = self.input_noise(x)
         encoded = self.encoder(x)
+        print(tf.shape(encoded))
         # latent_for_reconstruct = self.latent_noise(encoded)
         reconstruction = self.decoder(encoded)
         encode_for_reg = self.encoder(identity)

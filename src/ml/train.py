@@ -96,13 +96,14 @@ if __name__ == "__main__":
                 if "otherParses" in card:
                     del card["otherParses"]
         autoencoder = CC_Recommender(cards, max_cube_size, batch_size)
+        autoencoder.run_eagerly = True
         autoencoder.compile(
             optimizer='adam',
             loss=['binary_crossentropy', 'kullback_leibler_divergence'],
             loss_weights=[1.0, reg],
             metrics=['accuracy'],
         )
-        autoencoder.fit(generator, epochs=1)
+        autoencoder.fit(generator, epochs=1) # , use_multiprocessing=True)
         Path(temp_save_dir).mkdir(parents=True, exist_ok=True)
         autoencoder.save(temp_save_dir)
         print("Saved initial model")

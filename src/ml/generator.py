@@ -43,7 +43,7 @@ class DataGenerator(Sequence):
         self.neg_samplers = [self.neg_sampler[excludes]
                              / self.neg_sampler[excludes].sum()
                              for excludes in self.cube_excludes]
-        self.pool = Pool(30)
+        # self.pool = Pool(30)
         self.indices = np.arange(self.N_cubes)
         self.batches = []
         self.reset_indices()
