@@ -18,7 +18,8 @@ Epochs: 100
 
 Batch Size: 64
 """
-VOCAB_SIZE = 64
+VOCAB_SIZE = 16
+
 
 class Encoder(Model):
     """
@@ -133,8 +134,10 @@ class Encoder(Model):
         self.children = tf.constant([[child[i] for child in children]
                                 for i in range(len(node_labels))])
         self.node_labels = tf.constant(node_labels)
+        self.max_depth = max(node_depths)
         self.card_indices = tf.constant(card_indices)
         self.card_ranges = [[]]
+        self.card_ranges_depths = []
         max_indices_len = 0
         for i in range(1, len(card_indices)):
             indices = list(range(card_indices[i - 1], card_indices[i]))
@@ -143,6 +146,18 @@ class Encoder(Model):
         for indices in self.card_ranges:
             for _ in range(len(indices), max_indices_len):
                 indices.append(0)
+            self.card_ranges_depths.append([[x for x in indices if node_depths[x] == i]
+                                           for i in range(self.max_depth)])
+        max_len = max(len(indices)
+                      for node_indices_depth in self.card_ranges_depths
+                      for indices in node_indices_depth)
+        for card_ranges_depth in self.card_ranges_depths:
+            for indices in card_ranges_depth:
+                for _ in range(len(indices), max_len):
+                    indices.append(1)
+        self.card_ranges_depths = [tf.constant([self.card_ranges_depths[i][depth]
+                                                for i in range(len(cards) + 1)])
+                                   for depth in range(self.max_depth)]
         self.card_ranges = tf.constant(self.card_ranges)
         self.embedding = tf.keras.layers.Embedding(len(vocab_dict), VOCAB_SIZE, input_length=1,
                                                    name=self.assigned_name + "_vocab_embedding")
@@ -160,62 +175,51 @@ class Encoder(Model):
 
         print("finished preprocessing cards.")
 
-    def __process_cards(self, cube):
-        card_indices = tf.nn.embedding_lookup(self.card_indices, cube)
-        indices = tf.nn.embedding_lookup(self.card_ranges, cube)
-        y, _ = tf.unique(tf.reshape(indices, [-1]))
-        node_depths = tf.gather(self.node_depths, y)
+    def call(self, x, **kwargs):
+        print("called encoder.")
         tensor_array = tf.TensorArray(tf.float32, size=self.node_count, clear_after_read=False,
                                       infer_shape=True)
-        tensor_array = tensor_array.write(0, tf.zeros((1, VOCAB_SIZE)))
+        for i in range(self.node_count):
+            tensor_array = tensor_array.write(i, tf.zeros((VOCAB_SIZE,)))
 
-        def loop_cond(_, i):
-            return tf.less(i, self.max_depth + 1)
-
-        def loop_body(tensor_array, i):
-            idxs = tf.reshape(tf.gather(y, tf.where(tf.math.equal(node_depths, i))), [-1])
+        for i in range(self.max_depth):
+            idxs, _ = tf.unique(tf.reshape(tf.gather(self.card_ranges_depths[i], x), [-1]))
             our_batch_size = tf.shape(idxs)[0]
             our_node_labels = tf.gather(self.node_labels, idxs)
             our_children = tf.gather(self.children, idxs)
 
-            def inner_loop_cond(_, j):
+            def loop_cond(_, j):
                 return tf.less(j, our_batch_size)
 
-            def inner_loop_1_body(child_tensor_array, j):
+            def loop_1_body(child_tensor_array, j):
+                child_row = tf.gather(our_children, j)
                 child_tensor = tf.reshape(tf.concat(
-                        [tensor_array.read(tf.gather(tf.gather(our_children, j), k))
-                         for k in range(self.children_count)],
-                        0), [1, -1])
+                    [tensor_array.read(tf.gather(child_row, k))
+                     for k in range(self.children_count)],
+                    0), [1, -1])
                 child_tensor_array = child_tensor_array.write(j, child_tensor)
                 return child_tensor_array, j + 1
 
-            child_tensor_array = tf.TensorArray(tf.float32, size=our_batch_size,
-                                                clear_after_read=False, infer_shape=True)
-            child_tensor_array, _ = tf.while_loop(inner_loop_cond, inner_loop_1_body,
+            child_tensor_array = tf.TensorArray(tf.float32, size=our_batch_size, infer_shape=True)
+            child_tensor_array, _ = tf.while_loop(loop_cond, loop_1_body,
                                                   loop_vars=[child_tensor_array, 0],
-                                                  parallel_iterations=1000)
+                                                  parallel_iterations=100)
             our_vocab = self.embedding(our_node_labels)
             node_tensor = self.activation(self.add([our_vocab,
                                                     tf.linalg.matmul(child_tensor_array.concat(),
                                                                      self.W)]))
 
-            def inner_loop_2_body(tensor_array, j):
+            def loop_2_body(tensor_array, j):
                 tensor_array = tensor_array.write(tf.cast(tf.gather(idxs, j), tf.int32),
-                                                  tf.reshape(tf.gather(node_tensor, j), [1, -1]))
+                                                  tf.gather(node_tensor, j))
                 return tensor_array, j + 1
 
-            tensor_array, _ = tf.while_loop(inner_loop_cond, inner_loop_2_body,
-                                            loop_vars=[tensor_array, 0])
+            tensor_array, _ = tf.while_loop(loop_cond, loop_2_body,
+                                            loop_vars=[tensor_array, 0],
+                                            parallel_iterations=100)
 
-            return tensor_array, i + 1
-
-        tensor_array, _ = tf.while_loop(loop_cond, loop_body, loop_vars=[tensor_array, 0],
-                                        parallel_iterations=1000)
-        return tf.nn.embedding_lookup(tensor_array.concat(), card_indices)
-
-    def call(self, x, **kwargs):
-        print("called encoder.")
-        x = self.__process_cards(x)
+        card_tensors = tensor_array.gather(self.card_indices)
+        x = tf.nn.embedding_lookup(card_tensors, x)
         print(x.shape)
         x = self.flatten(x)
         print(x.shape)
