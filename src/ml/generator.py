@@ -1,8 +1,9 @@
+import json
 from collections import Counter
-from multiprocessing import Queue
-from multiprocessing.pool import Pool
+from pathlib import Path
 
 from tensorflow.keras.utils import Sequence
+from tensorflow.keras.preprocessing.sequence import skipgrams
 import numpy as np
 import random
 
@@ -67,6 +68,7 @@ class DataGenerator(Sequence):
             np.arange(self.N_cards),
             len(main_indices),
             p=self.neg_sampler,
+            replace=False,
         )
 
         X, y = self.generate_data(
@@ -140,3 +142,108 @@ class DataGenerator(Sequence):
 
         x_cubes = np.array(processed_cubes).astype(int)
         return [(x_cubes, x_regularization), (y_cubes, y_regularization)]
+
+
+class CardDataGenerator(Sequence):
+    def __init__(self, adj_mtx, walk_len, num_walks, batch_size, data_path=None):
+        super(CardDataGenerator).__init__()
+        self.num_cards = adj_mtx.shape[0]
+        if data_path is not None:
+            if Path(data_path).is_file():
+                with open(data_path, 'r') as data_file:
+                    self.data = json.load(data_file)
+            else:
+                self.data = self.generate_data(adj_mtx, walk_len, num_walks)
+                with open(data_path, 'w') as data_file:
+                    json.dump(self.data, data_file)
+        else:
+            self.data = self.generate_data(adj_mtx, walk_len, num_walks)
+        self.batch_size = batch_size
+
+    def generate_data(self, adj_mtx, walk_len, num_walks):
+        y_mtx = adj_mtx.copy()
+        np.fill_diagonal(y_mtx, 0)
+        y_mtx = (y_mtx / y_mtx.sum(1)[:, None])
+        positive_examples = [Counter() for _ in range(self.num_cards + 1)]
+        negative_examples = [Counter() for _ in range(self.num_cards + 1)]
+        for walk in range(num_walks):
+            counter = 0
+            examples = self.calculate_skipgrams(y_mtx, walk_len)
+            for example in examples:
+                counter += 1
+                positive, negative = example
+                for i, j in positive:
+                    positive_examples[i][j] += 1
+                for i, j in negative:
+                    negative_examples[i][j] += 1
+                if counter % 100 == 99:
+                    print(counter + 1)
+            print("Walk", walk, '\n')
+        for positive, negative in zip(positive_examples, negative_examples):
+            for key in list(positive.keys()):
+                if key in negative:
+                    if positive[key] > negative[key]:
+                        del negative[key]
+                    else:
+                        del positive[key]
+        for i, positive in enumerate(positive_examples):
+            for j in list(positive.keys()):
+                del positive_examples[j][i]
+                if i in negative_examples[j]:
+                    if positive[j] > negative_examples[j][i]:
+                        del negative_examples[j][i]
+                    else:
+                        del positive_examples[i][j]
+        for i, negative in enumerate(negative_examples):
+            for j in list(negative.keys()):
+                del negative_examples[j][i]
+        return [(i, j, 1)
+                for i, positive in enumerate(positive_examples)
+                for j in positive.keys()] + [(i, j, 0)
+                                             for i, negative in enumerate(negative_examples)
+                                             for j in negative.keys()]
+
+    def calculate_skipgrams(self, y_mtx, walk_len):
+        nodes = [i for i in range(self.num_cards + 1)]
+        y_mtx = np.concatenate((np.zeros((self.num_cards, 1)), y_mtx), 1)
+        for i in range(self.num_cards):
+            walk = [i + 1]
+            cur_node = i + 1
+            for _ in range(walk_len):
+                sampling_table = y_mtx[cur_node - 1]
+                cur_node = np.random.choice(nodes, p=sampling_table)
+                walk.append(cur_node)
+            couples, labels = skipgrams(walk, self.num_cards + 1, negative_samples=1.0)
+            positive = []
+            negative = []
+            for couple, label in zip(couples, labels):
+                i, j = couple
+                i = int(i)
+                j = int(i)
+                if label == 1:
+                    positive.append((i, j))
+                    positive.append((j, i))
+                elif label == 0:
+                    negative.append((i, j))
+                    negative.append((j, i))
+            yield positive, negative
+
+    def __len__(self):
+        return len(self.data) / self.batch_size
+
+    def __getitem__(self, item):
+        a_s = []
+        b_s = []
+        y_s = []
+        for i in range(self.batch_size):
+            a, b, y = self.data[self.batch_size * item + i]
+            a_s.append(a)
+            b_s.append(b)
+            y_s.append(y)
+        return [(a_s, b_s), (y_s,)]
+
+    def on_epoch_end(self):
+        """
+        Update indices after each epoch
+        """
+        np.random.shuffle(self.data)

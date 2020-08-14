@@ -74,7 +74,7 @@ def build_cubes(cube_folder, num_cubes, num_cards,
         with open(full_path, 'rb') as fp:
             contents = json.load(fp)
         for cube in contents:
-            if len(cube) == 0 or len(cube) > 850:
+            if len(cube) == 0 or len(cube) > 720:
                 continue
             card_ids = []
             for card_name in cube:
@@ -85,7 +85,7 @@ def build_cubes(cube_folder, num_cubes, num_cards,
             if len(card_ids) > 0:
                 cubes.append(card_ids)
     max_cube_size = max(len(cube) for cube in cubes)
-    print(max_cube_size)
+    print(max_cube_size, len(cubes))
     for cube in cubes:
         cube += [0 for _ in range(len(cube), max_cube_size)]
     return cubes, max_cube_size

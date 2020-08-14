@@ -37,7 +37,7 @@ fp.close()
 
 card_names = mystr.split("\n")
 
-print ('Loading Card Name Lookup . . . \n')
+print('Loading Card Name Lookup . . . \n')
 
 int_to_card = json.load(open('ml_files/recommender_id_map.json','rb'))
 int_to_card = {int(k):v for k,v in int_to_card.items()}
@@ -49,7 +49,7 @@ _, max_cube_size = utils.build_cubes(folder, num_cubes,
                                      num_cards, card_to_int)
 num_cards = len(int_to_card)
 
-print ('Creating Cube Vector . . . \n')
+print('Creating Cube Vector . . . \n')
 
 cube_indices = []
 for name in card_names:
@@ -58,11 +58,12 @@ for name in card_names:
     if idx is not None:
         cube_indices.append(idx + 1)
 cube_indices += [0 for _ in range(len(cube_indices), max_cube_size)]
+cube_indices = cube_indices[:max_cube_size]
 cube = np.array(cube_indices)
 
 print('Loading Model . . . \n')
 
-model = load_model('ml_files/recommender7')
+model = load_model('ml_files/recommender-code2seq')
 
 # def encode(model,data):
 #     return model.encoder.bottleneck(

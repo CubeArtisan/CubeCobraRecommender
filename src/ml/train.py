@@ -41,9 +41,9 @@ if __name__ == "__main__":
 
     print('Loading Cube Data . . .\n')
 
-    int_to_card = json.load(open('././output/int_to_card.json','rb'))
-    int_to_card = {int(k):v for k,v in int_to_card.items()}
-    card_to_int = {v:k for k,v in int_to_card.items()}
+    int_to_card = json.load(open('././output/int_to_card.json', 'rb'))
+    int_to_card = {int(k): v for k, v in int_to_card.items()}  # if int(k) < 1000}
+    card_to_int = {v: k for k, v in int_to_card.items()}
 
     num_cubes = utils.get_num_cubes(folder)
     num_cards = len(int_to_card)
@@ -66,7 +66,7 @@ if __name__ == "__main__":
     # y_mtx = (adj_mtx/adj_mtx.sum(1)[:,None])
     # y_mtx = np.nan_to_num(y_mtx,0)
     # y_mtx[np.where(y_mtx.sum(1) == 0),np.where(y_mtx.sum(1) == 0)] = 1
-
+    #  adj_mtx = adj_mtx[:1000, :1000]
     y_mtx = (adj_mtx/adj_mtx.sum(1)[:, None])
 
     print('Setting Up Data for Training . . .\n')
@@ -95,7 +95,7 @@ if __name__ == "__main__":
             for card in cards:
                 if "otherParses" in card:
                     del card["otherParses"]
-        autoencoder = CC_Recommender(cards, max_cube_size, batch_size)
+        autoencoder = CC_Recommender(cards, max_cube_size)
         autoencoder.run_eagerly = True
         autoencoder.compile(
             optimizer='adam',
@@ -117,6 +117,7 @@ if __name__ == "__main__":
     latest_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
     if latest_checkpoint is not None:
         autoencoder.load_weights(latest_checkpoint)
+        autoencoder.save(output_dir, save_format='tf')
     cp_callback = tf.keras.callbacks.ModelCheckpoint(
         filepath=checkpoint_path,
         verbose=1,

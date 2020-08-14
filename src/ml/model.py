@@ -20,10 +20,12 @@ Epochs: 100
 
 Batch Size: 64
 """
-VOCAB_SIZE = 8
-PATH_COUNT = 8
-RNN_SIZE = 4
+VOCAB_SIZE = 32
+PATH_COUNT = 256
+RNN_SIZE = 64
 EMBED_SIZE = 64
+CARD_EMBED_SIZE = 64
+MAX_PATH_LENGTH = 1024
 
 
 def convert_structure(structure: Union[list, dict, int, str, bool],
@@ -82,29 +84,15 @@ def convert_structure(structure: Union[list, dict, int, str, bool],
     return our_index, max_child_height + 1
 
 
-class Encoder(Model):
+class CardEncoder(Model):
     """
-    Encoder part of the model -> compress dimensionality
+    Encode cards to vectors
     """
-    def __init__(self, name, cards, max_cube_size, batch_size):
+    def __init__(self, name, cards, width):
         super().__init__()
         self.assigned_name = name
-        self.max_cube_size = max_cube_size
-        self.batch_size = batch_size
-        self.flatten = tf.keras.layers.Flatten(name=name + "_flatten")
-        self.__preprocess_cards(cards)
-        # self.input_drop = Dropout(0.2)
-        self.encoded_1 = Dense(EMBED_SIZE * 8, activation='relu', name=name + "_e1")
-        # self.e1_drop = Dropout(0.5)
-        self.encoded_2 = Dense(EMBED_SIZE * 4, activation='relu', name=name + "_e2")
-        # self.e2_drop = Dropout(0.5)
-        self.encoded_3 = Dense(EMBED_SIZE * 2, activation='relu', name=name + "_e3")
-        # self.e3_drop = Dropout(0.2)
-        self.bottleneck = Dense(EMBED_SIZE, activation='relu',
-                                name=name + "_bottleneck")
-
-    def __preprocess_cards(self, cards):
-        vocab_dict = {"": 0}
+        self.width = width
+        vocab_dict = {"<unkown>": 0}
         children = []
         node_labels = [0]
         card_indices = []
@@ -134,17 +122,29 @@ class Encoder(Model):
             paths = []
             index_range = [x for x in range(min_index, max_index) if node_heights[x] == 0]
             computed_values = defaultdict(lambda: defaultdict(lambda: False))
+            used_indices = set()
             iterations = 0
             if len(index_range) == 0:
                 all_paths.append([])
                 continue
-            while len(paths) < PATH_COUNT and iterations < PATH_COUNT * 1.2:
+            while len(paths) < PATH_COUNT and iterations < PATH_COUNT * 2:
                 iterations += 1
-                start = random.choice(index_range)
+                new_index_range = [x for x in index_range if x not in used_indices]
+                if len(new_index_range) > 0:
+                    start = random.choice(new_index_range)
+                else:
+                    start = random.choice(index_range)
                 remaining = [x for x in index_range if x != start and not computed_values[start][x]]
+
                 if len(remaining) == 0:
                     continue
-                end = random.choice(remaining)
+                new_remaining = [x for x in remaining if x not in used_indices]
+                if len(new_remaining) > 0:
+                    end = random.choice(new_remaining)
+                else:
+                    end = random.choice(remaining)
+                used_indices.add(start)
+                used_indices.add(end)
                 computed_values[start][end] = True
                 computed_values[end][start] = True
                 start_depth = node_depths[start]
@@ -165,6 +165,8 @@ class Encoder(Model):
                     end_path.append(end)
                 path.append(node_parents[start])
                 path += end_path[::-1]
+                if len(path) > MAX_PATH_LENGTH:
+                    continue
                 paths.append(path)
                 max_path_length = max(len(path), max_path_length)
             all_paths.append(paths)
@@ -186,53 +188,59 @@ class Encoder(Model):
         self.all_paths = tf.constant(all_paths)
         self.path_lengths = tf.constant(path_lengths)
         self.embedding = tf.keras.layers.Embedding(len(vocab_dict), VOCAB_SIZE,
-                                                   name=self.assigned_name + "_vocab_embedding")
-        rnn_cell_fw = tf.keras.layers.LSTMCell(RNN_SIZE // 2)
-        rnn_cell_bw = tf.keras.layers.LSTMCell(RNN_SIZE // 2)
+                                                   name=self.assigned_name + "_vocab_embedding",
+                                                   mask_zero=True)
+        self.rnn_cell = tf.keras.layers.LSTMCell(RNN_SIZE // 2)
         self.rnn = tf.keras.layers.Bidirectional(
-            layer=tf.keras.layers.RNN(rnn_cell_fw, return_state=True),
-            backward_layer=tf.keras.layers.RNN(rnn_cell_bw, go_backwards=True,
+            layer=tf.keras.layers.RNN(self.rnn_cell, return_state=True),
+            backward_layer=tf.keras.layers.RNN(self.rnn_cell, go_backwards=True,
                                                return_state=True),
             merge_mode="concat",
             name=self.assigned_name + "_bidirectional",
             dtype=tf.float32)
         # rnn_cell = tf.keras.layers.LSTMCell(RNN_SIZE)
         # self.rnn = tf.keras.layers.RNN(rnn_cell, dtype=tf.float32, return_state=True)
+        self.embed_dense = Dense(CARD_EMBED_SIZE, activation="tanh")
         print('preprocessed cards')
 
-    def call(self, x, training=False, mask=None):
-        all_paths = tf.nn.embedding_lookup(self.all_paths, x)
-        all_path_embed = self.embedding(all_paths) # batch_size, max_cube_size, VOCAB_SIZE
-        flat_paths = tf.reshape(all_path_embed, shape=[-1, self.max_path_length, VOCAB_SIZE])
-        path_lengths = tf.nn.embedding_lookup(self.path_lengths, x)
-        flat_valid_contexts_mask = tf.expand_dims(tf.sequence_mask(tf.reshape(path_lengths, [-1]),
-                                                                   maxlen=self.max_path_length,
-                                                                   dtype=tf.float32), axis=-1)
-        _, state_fw, _, state_bw, _ = self.rnn(inputs=flat_paths, mask=flat_valid_contexts_mask,
-                                               training=training)
+    def call(self, x, training=None, mask=None):
+        cards = tf.reshape(x, [-1])
+        all_paths = tf.gather(self.all_paths, cards)
+        all_paths_embed = self.embedding(all_paths)
+        flat_paths_embed = tf.reshape(all_paths_embed, [-1, self.max_path_length, VOCAB_SIZE])
+        _, state_fw, _, state_bw, _ = self.rnn(inputs=flat_paths_embed)
         final_rnn_state = tf.concat([state_fw, state_bw], -1)
 
-        # _, final_rnn_state, _ = self.rnn(inputs=flat_paths, mask=flat_valid_contexts_mask,
-        #                                  training=training)
-        print(tf.shape(final_rnn_state))
-        x = tf.reshape(final_rnn_state, [-1, self.max_cube_size * self.max_paths * RNN_SIZE])
-        # x = self.dropout(path_nodes_aggregation, training=training)
-        # x = self.embed_dense_layer(inputs=path_nodes_aggregation)
-        print('finished processing cards')
-        print(x.shape)
-        encoded = self.encoded_1(x)
-        # encoded = self.e1_drop(encoded)
-        encoded = self.encoded_2(encoded)
-        # encoded = self.e2_drop(encoded)
-        encoded = self.encoded_3(encoded)
-        # encoded = self.e3_drop(encoded)
-        return self.bottleneck(encoded)
+        concated = tf.reshape(final_rnn_state, [-1, self.width * self.max_paths * RNN_SIZE])
+        if self.max_path_length * RNN_SIZE == CARD_EMBED_SIZE:
+            return concated
+        else:
+            return self.embed_dense(concated)
 
-    # def call_for_reg(self, x):
-    #     encoded = self.encoded_1(x)
-    #     encoded = self.encoded_2(encoded)
-    #     encoded = self.encoded_3(encoded)
-    #     return self.bottleneck(encoded)
+
+class Encoder(Model):
+    """
+    Encoder part of the model -> compress dimensionality
+    """
+    def __init__(self, name, cards, max_cube_size):
+        super().__init__()
+        self.assigned_name = name
+        self.card_encoder = CardEncoder(name + "_card_encoder", cards, max_cube_size)
+        self.flatten = tf.keras.layers.Flatten(name=name + "_flatten")
+        self.encoded_1 = Dense(EMBED_SIZE * 8, activation='relu', name=name + "_e1")
+        self.encoded_2 = Dense(EMBED_SIZE * 4, activation='relu', name=name + "_e2")
+        self.encoded_3 = Dense(EMBED_SIZE * 2, activation='relu', name=name + "_e3")
+        self.bottleneck = Dense(EMBED_SIZE, activation='relu',
+                                name=name + "_bottleneck")
+
+    def call(self, x, training=False, mask=None):
+        print(x.shape)
+        encoded = self.card_encoder(x)
+        print(x.shape)
+        encoded = self.encoded_1(encoded)
+        encoded = self.encoded_2(encoded)
+        encoded = self.encoded_3(encoded)
+        return self.bottleneck(encoded)
 
 
 class Decoder(Model):
@@ -242,13 +250,9 @@ class Decoder(Model):
     """
     def __init__(self, name, output_dim, output_act):
         super().__init__()
-        # self.bottleneck_drop = Dropout(0.2)
         self.decoded_1 = Dense(EMBED_SIZE * 2, activation='relu', name=name + "_d1")
-        # self.d1_drop = Dropout(0.4)
         self.decoded_2 = Dense(EMBED_SIZE * 4, activation='relu', name=name + "_d2")
-        # self.d2_drop = Dropout(0.4)
         self.decoded_3 = Dense(EMBED_SIZE * 8, activation='relu', name=name + "_d3")
-        # self.d3_drop = Dropout(0.2)
         self.reconstruct = Dense(output_dim, activation=output_act,
                                  name=name + "_reconstruction")
 
@@ -258,15 +262,46 @@ class Decoder(Model):
         decoded = self.decoded_3(decoded)
         return self.reconstruct(decoded)
 
-    # def call_for_reg(self, x):
-    #     x = self.bottleneck_drop(x)
-    #     decoded = self.decoded_1(x)
-    #     decoded = self.d1_drop(decoded)
-    #     decoded = self.decoded_2(decoded)
-    #     decoded = self.d2_drop(decoded)
-    #     decoded = self.decoded_3(decoded)
-    #     decoded = self.d3_drop(decoded)
-    #     return self.reconstruct(decoded)
+
+class CardEncoderWrapper(Model):
+    """
+    AutoEncoder build as a recommender system based on the following idea:
+
+        If our input is a binary vector where 1 represents the presence of an
+        item in a collection, then an autoencoder trained
+    """
+    def __init__(self, cards):
+        super().__init__()
+        self.N = len(cards)
+        self.card_encoder = CardEncoder("card_encoder", cards, 1)
+        self.activation = tf.keras.layers.Activation("sigmoid")
+        self.dot = tf.keras.layers.Dot(1, normalize=True)
+
+    def summary(self, **kwargs):
+        super().summary(**kwargs)
+        self.card_encoder.summary(**kwargs)
+
+    def call(self, input, **kwargs):
+        """
+        input contains two things:
+            input[0] = the binary vectors representing the collections
+            input[1] = a diagonal matrix of size (self.N X self.N)
+
+        We run the same encoder for each type of input, but with different
+        decoders. This is because the goal is to make sure that the compression
+        for collections still does a reasonable job compressing individual
+        items. So a penalty term (regularization) is added to the model in the
+        ability to reconstruct the probability distribution (adjacency matrix)
+        on the item level from the encoding.
+
+        The hope is that this regularization enforces this conditional
+        probability to be embedded in the recommendations. As the individual
+        items must pull towards items represented strongly within the graph.
+        """
+        a, b = input
+        a_embed = self.card_encoder(a)
+        b_embed = self.card_encoder(b)
+        return self.activation(self.dot([a_embed, b_embed]))
 
 
 class CC_Recommender(Model):
@@ -276,15 +311,13 @@ class CC_Recommender(Model):
         If our input is a binary vector where 1 represents the presence of an
         item in a collection, then an autoencoder trained
     """
-    def __init__(self, cards, max_cube_size, batch_size):
+    def __init__(self, cards, max_cube_size):
         super().__init__()
         self.N = len(cards)
-        self.encoder = Encoder("encoder", cards, max_cube_size, batch_size)
+        self.encoder = Encoder("encoder", cards, max_cube_size)
         # sigmoid because input is a binary vector we want to reproduce
         self.decoder = Decoder("main", self.N, output_act='sigmoid')
         # softmax because the graph information is probabilities
-        # self.input_noise = Dropout(0.5)
-        # self.latent_noise = Dropout(0.2)
         self.decoder_for_reg = Decoder("reg", self.N, output_act='softmax')
 
     def call(self, input, **kwargs):
@@ -305,12 +338,9 @@ class CC_Recommender(Model):
         items must pull towards items represented strongly within the graph.
         """
         x, identity = input
-        # x = self.input_noise(x)
         encoded = self.encoder(x)
         print(tf.shape(encoded))
-        # latent_for_reconstruct = self.latent_noise(encoded)
         reconstruction = self.decoder(encoded)
         encode_for_reg = self.encoder(identity)
-        # latent_for_reg = self.latent_noise(encode_for_reg)
         decoded_for_reg = self.decoder_for_reg(encode_for_reg)
         return reconstruction, decoded_for_reg
