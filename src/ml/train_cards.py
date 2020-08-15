@@ -23,7 +23,6 @@ if __name__ == "__main__":
     batch_size = int(args[1])
     name = args[2]
     walk_len = int(args[3])
-    num_walks = int(args[4])
 
     map_file = '././data/maps/nameToId.json'
     folder = "././data/cube/"
@@ -38,18 +37,20 @@ if __name__ == "__main__":
     print('Loading Adjacency Matrix . . .\n')
 
     adj_mtx = np.load('././output/full_adj_mtx.npy')
+    card_counts = np.load('././output/card_counts.npy')
 
     print('Setting up Generator . . .\n')
     generator = CardDataGenerator(
         adj_mtx,
         walk_len,
-        num_walks,
+        card_counts,
         batch_size=batch_size,
         data_path='././output/card_generator_data.json',
     )
 
     print('Setting Up Model . . . \n')
     output_dir = f'././ml_files/{name}'
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
     with open('cards.json', 'r', encoding="utf-8") as cardsjson:
         cards = json.load(cardsjson)
         cards = [cards.get(int_to_card[i], "") for i in range(num_cards)]
@@ -64,28 +65,18 @@ if __name__ == "__main__":
         loss_weights=[1.0],
         metrics=['accuracy'],
     )
-    autoencoder.fit(generator, epochs=1)  # , use_multiprocessing=True)
-
-    print(autoencoder.summary())
 
     # pdb.set_trace()
-    checkpoint_path = output_dir + '/checkpoints/cp-{epoch:04d}.ckpt'
-    checkpoint_dir = os.path.dirname(checkpoint_path)
-    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
-    latest_checkpoint = tf.train.latest_checkpoint(checkpoint_dir)
-    if latest_checkpoint is not None:
-        autoencoder.load_weights(latest_checkpoint)
-        autoencoder.save(output_dir, save_format='tf')
     cp_callback = tf.keras.callbacks.ModelCheckpoint(
-        filepath=checkpoint_path,
-        verbose=1,
-        save_weights_only=True,
-        period=5)
+        filepath=output_dir,
+        monitor='val_loss',
+        save_best_only=True,
+        mode='min',
+        save_freq='epoch')
+    early_stop_callback = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=10,
+                                                           min_delta=0.005)
     autoencoder.fit(
         generator,
         epochs=epochs,
-        callbacks=[cp_callback]
+        callbacks=[cp_callback, early_stop_callback]
     )
-
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    autoencoder.save(output_dir, save_format='tf')

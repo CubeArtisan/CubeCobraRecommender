@@ -1,4 +1,5 @@
 import json
+from bisect import bisect_left
 from collections import Counter
 from pathlib import Path
 
@@ -144,13 +145,30 @@ class DataGenerator(Sequence):
         return [(x_cubes, x_regularization), (y_cubes, y_regularization)]
 
 
+def get_cumulative_dist(dist):
+    acc = 0
+    result = []
+    for prob in dist:
+        acc += prob
+        result.append(acc)
+    return result
+
+
+def sample_index_from_cumulative(cum_dist):
+    value = np.random.rand()
+    return bisect_left(cum_dist, value)
+
+
 class CardDataGenerator(Sequence):
-    def __init__(self, adj_mtx, walk_len, num_walks, batch_size, data_path=None):
+    def __init__(self, adj_mtx, walk_len, card_counts, batch_size, data_path=None):
         super(CardDataGenerator).__init__()
         self.num_cards = adj_mtx.shape[0]
         self.batch_size = batch_size
         self.walk_len = walk_len
-        self.num_walks = num_walks
+        self.num_walks = 1
+        card_counts = np.concatenate(([0], card_counts))
+        card_counts = card_counts / card_counts.sum()
+        self.card_counts = get_cumulative_dist(card_counts)
         y_mtx = adj_mtx.copy()
         print('Normalizing and threshholding')
         too_small = np.where(adj_mtx < 0.05)
@@ -164,6 +182,7 @@ class CardDataGenerator(Sequence):
         for i, j in zip(*non_zero):
             self.y_probs[i + 1].append(y_mtx[i][j])
             self.y_indices[i + 1].append(j + 1)
+        self.y_probs = [get_cumulative_dist(probs) for probs in self.y_probs]
         self.on_epoch_end()
 
     def generate_data(self):
@@ -207,15 +226,19 @@ class CardDataGenerator(Sequence):
                                              for j in negative.keys()]
 
     def calculate_skipgrams(self):
+        card_indices = [i for i in range(self.num_cards + 1)]
         for i in range(1, self.num_cards + 1):
             walk = [i]
             cur_node = i
             for _ in range(self.walk_len):
                 sampling_table = self.y_probs[cur_node]
                 nodes = self.y_indices[cur_node]
-                cur_node = np.random.choice(nodes, p=sampling_table)
+                node_index = sample_index_from_cumulative(sampling_table)
+                cur_node = nodes[node_index]
                 walk.append(cur_node)
-            couples, labels = skipgrams(walk, self.num_cards + 1, negative_samples=1.0)
+            couples, labels = skipgrams(walk, self.num_cards + 1,
+                                        negative_samples=0.0,
+                                        window_size=2)
             positive = []
             negative = []
             for couple, label in zip(couples, labels):
@@ -225,9 +248,12 @@ class CardDataGenerator(Sequence):
                 if label == 1:
                     positive.append((i, j))
                     positive.append((j, i))
-                elif label == 0:
-                    negative.append((i, j))
-                    negative.append((j, i))
+                    neg_i = sample_index_from_cumulative(self.card_counts)
+                    neg_j = sample_index_from_cumulative(self.card_counts)
+                    negative.append((i, neg_i))
+                    negative.append((neg_i, i))
+                    negative.append((j, neg_j))
+                    negative.append((neg_j, j))
             yield positive, negative
 
     def __len__(self):
