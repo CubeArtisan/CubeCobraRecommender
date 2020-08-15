@@ -148,35 +148,38 @@ class CardDataGenerator(Sequence):
     def __init__(self, adj_mtx, walk_len, num_walks, batch_size, data_path=None):
         super(CardDataGenerator).__init__()
         self.num_cards = adj_mtx.shape[0]
-        if data_path is not None:
-            if Path(data_path).is_file():
-                with open(data_path, 'r') as data_file:
-                    self.data = json.load(data_file)
-            else:
-                self.data = self.generate_data(adj_mtx, walk_len, num_walks)
-                with open(data_path, 'w') as data_file:
-                    json.dump(self.data, data_file)
-        else:
-            self.data = self.generate_data(adj_mtx, walk_len, num_walks)
         self.batch_size = batch_size
-
-    def generate_data(self, adj_mtx, walk_len, num_walks):
+        self.walk_len = walk_len
+        self.num_walks = num_walks
         y_mtx = adj_mtx.copy()
+        print('Normalizing and threshholding')
+        too_small = np.where(adj_mtx < 0.05)
+        y_mtx[too_small] = 0
         np.fill_diagonal(y_mtx, 0)
         y_mtx = (y_mtx / y_mtx.sum(1)[:, None])
+        self.y_probs = [[] for _ in range(self.num_cards + 1)]
+        self.y_indices = [[] for _ in range(self.num_cards + 1)]
+        print('Building adjacency graph structure.')
+        non_zero = np.where(y_mtx > 0)
+        for i, j in zip(*non_zero):
+            self.y_probs[i + 1].append(y_mtx[i][j])
+            self.y_indices[i + 1].append(j + 1)
+        self.on_epoch_end()
+
+    def generate_data(self):
+        print('Calculating walks.')
         positive_examples = [Counter() for _ in range(self.num_cards + 1)]
         negative_examples = [Counter() for _ in range(self.num_cards + 1)]
-        for walk in range(num_walks):
+        for walk in range(self.num_walks):
             counter = 0
-            examples = self.calculate_skipgrams(y_mtx, walk_len)
-            for example in examples:
+            examples = self.calculate_skipgrams()
+            for positive, negative in examples:
                 counter += 1
-                positive, negative = example
                 for i, j in positive:
                     positive_examples[i][j] += 1
                 for i, j in negative:
                     negative_examples[i][j] += 1
-                if counter % 100 == 99:
+                if counter % 1000 == 999:
                     print(counter + 1)
             print("Walk", walk, '\n')
         for positive, negative in zip(positive_examples, negative_examples):
@@ -203,14 +206,13 @@ class CardDataGenerator(Sequence):
                                              for i, negative in enumerate(negative_examples)
                                              for j in negative.keys()]
 
-    def calculate_skipgrams(self, y_mtx, walk_len):
-        nodes = [i for i in range(self.num_cards + 1)]
-        y_mtx = np.concatenate((np.zeros((self.num_cards, 1)), y_mtx), 1)
-        for i in range(self.num_cards):
-            walk = [i + 1]
-            cur_node = i + 1
-            for _ in range(walk_len):
-                sampling_table = y_mtx[cur_node - 1]
+    def calculate_skipgrams(self):
+        for i in range(1, self.num_cards + 1):
+            walk = [i]
+            cur_node = i
+            for _ in range(self.walk_len):
+                sampling_table = self.y_probs[cur_node]
+                nodes = self.y_indices[cur_node]
                 cur_node = np.random.choice(nodes, p=sampling_table)
                 walk.append(cur_node)
             couples, labels = skipgrams(walk, self.num_cards + 1, negative_samples=1.0)
@@ -219,7 +221,7 @@ class CardDataGenerator(Sequence):
             for couple, label in zip(couples, labels):
                 i, j = couple
                 i = int(i)
-                j = int(i)
+                j = int(j)
                 if label == 1:
                     positive.append((i, j))
                     positive.append((j, i))
@@ -229,7 +231,7 @@ class CardDataGenerator(Sequence):
             yield positive, negative
 
     def __len__(self):
-        return len(self.data) / self.batch_size
+        return len(self.data) // self.batch_size
 
     def __getitem__(self, item):
         a_s = []
@@ -240,10 +242,15 @@ class CardDataGenerator(Sequence):
             a_s.append(a)
             b_s.append(b)
             y_s.append(y)
-        return [(a_s, b_s), (y_s,)]
+        a_s = np.array(a_s).reshape((self.batch_size, 1))
+        b_s = np.array(b_s).reshape((self.batch_size, 1))
+        x_s = np.concatenate((a_s, b_s), 1)
+        y_s = np.array(y_s).reshape((self.batch_size, 1))
+        return x_s, y_s
 
     def on_epoch_end(self):
         """
         Update indices after each epoch
         """
+        self.data = self.generate_data()
         np.random.shuffle(self.data)

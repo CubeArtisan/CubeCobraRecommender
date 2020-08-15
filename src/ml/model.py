@@ -298,7 +298,7 @@ class CardEncoderWrapper(Model):
         probability to be embedded in the recommendations. As the individual
         items must pull towards items represented strongly within the graph.
         """
-        a, b = input
+        a, b = tf.unstack(input, 2, 1)
         a_embed = self.card_encoder(a)
         b_embed = self.card_encoder(b)
         return self.activation(self.dot([a_embed, b_embed]))
