@@ -1,12 +1,12 @@
-import json
 from bisect import bisect_left
 from collections import Counter
-from pathlib import Path
 
 from tensorflow.keras.utils import Sequence
 from tensorflow.keras.preprocessing.sequence import skipgrams
 import numpy as np
 import random
+
+WINDOW_SIZE = 2
 
 
 class DataGenerator(Sequence):
@@ -170,9 +170,6 @@ class CardDataGenerator(Sequence):
         card_counts = card_counts / card_counts.sum()
         self.card_counts = get_cumulative_dist(card_counts)
         y_mtx = adj_mtx.copy()
-        print('Normalizing and threshholding')
-        too_small = np.where(adj_mtx < 0.05)
-        y_mtx[too_small] = 0
         np.fill_diagonal(y_mtx, 0)
         y_mtx = (y_mtx / y_mtx.sum(1)[:, None])
         self.y_probs = [[] for _ in range(self.num_cards + 1)]
@@ -189,18 +186,13 @@ class CardDataGenerator(Sequence):
         print('Calculating walks.')
         positive_examples = [Counter() for _ in range(self.num_cards + 1)]
         negative_examples = [Counter() for _ in range(self.num_cards + 1)]
-        for walk in range(self.num_walks):
-            counter = 0
+        for _ in range(self.num_walks):
             examples = self.calculate_skipgrams()
             for positive, negative in examples:
-                counter += 1
                 for i, j in positive:
                     positive_examples[i][j] += 1
                 for i, j in negative:
                     negative_examples[i][j] += 1
-                if counter % 1000 == 999:
-                    print(counter + 1)
-            print("Walk", walk, '\n')
         for positive, negative in zip(positive_examples, negative_examples):
             for key in list(positive.keys()):
                 if key in negative:
@@ -238,7 +230,7 @@ class CardDataGenerator(Sequence):
                 walk.append(cur_node)
             couples, labels = skipgrams(walk, self.num_cards + 1,
                                         negative_samples=0.0,
-                                        window_size=2)
+                                        window_size=WINDOW_SIZE)
             positive = []
             negative = []
             for couple, label in zip(couples, labels):
@@ -257,6 +249,8 @@ class CardDataGenerator(Sequence):
             yield positive, negative
 
     def __len__(self):
+        self.data = self.generate_data()
+        np.random.shuffle(self.data)
         return len(self.data) // self.batch_size
 
     def __getitem__(self, item):
@@ -274,9 +268,8 @@ class CardDataGenerator(Sequence):
         y_s = np.array(y_s).reshape((self.batch_size, 1))
         return x_s, y_s
 
-    def on_epoch_end(self):
+    def on_epoch_end(self, *args):
         """
         Update indices after each epoch
         """
-        self.data = self.generate_data()
-        np.random.shuffle(self.data)
+        pass

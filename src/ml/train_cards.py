@@ -69,14 +69,16 @@ if __name__ == "__main__":
     # pdb.set_trace()
     cp_callback = tf.keras.callbacks.ModelCheckpoint(
         filepath=output_dir,
-        monitor='val_loss',
+        monitor='loss',
+        verbose=True,
         save_best_only=True,
         mode='min',
         save_freq='epoch')
-    early_stop_callback = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=10,
-                                                           min_delta=0.005)
+    early_stop_callback = tf.keras.callbacks.EarlyStopping(monitor='loss',
+                                                           patience=10,
+                                                           min_delta=0.002)
     autoencoder.fit(
         generator,
         epochs=epochs,
-        callbacks=[cp_callback, early_stop_callback]
+        callbacks=[cp_callback]  #, early_stop_callback]
     )
