@@ -40,15 +40,6 @@ if __name__ == "__main__":
     card_counts = np.load('././output/card_counts.npy')
 
     print('Setting up Generator . . .\n')
-    generator = CardDataGenerator(
-        adj_mtx,
-        walk_len,
-        card_counts,
-        batch_size=batch_size,
-        data_path='././output/card_generator_data.json',
-    )
-
-    print('Setting Up Model . . . \n')
     output_dir = f'././ml_files/{name}'
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     with open('cards.json', 'r', encoding="utf-8") as cardsjson:
@@ -57,7 +48,16 @@ if __name__ == "__main__":
         for card in cards:
             if "otherParses" in card:
                 del card["otherParses"]
-    autoencoder = CardEncoderWrapper(cards)
+    generator = CardDataGenerator(
+        adj_mtx,
+        walk_len,
+        card_counts,
+        cards,
+        batch_size=batch_size,
+        data_path='././output/card_generator_data.json',
+    )
+    print('Setting Up Model . . . \n')
+    autoencoder = CardEncoderWrapper(generator.vocab_count, generator.max_paths, generator.max_path_length)
     autoencoder.run_eagerly = True
     autoencoder.compile(
         optimizer='adam',
