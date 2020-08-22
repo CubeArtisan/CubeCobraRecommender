@@ -13,8 +13,10 @@ if __name__ == "__main__":
     sys.path.append(dir(sys.path[0]))
 
 from generator import DataGenerator
-from model import CC_Recommender
+from model import CC_Recommender, CardEncoderWrapper
 from non_ml import utils
+from ml import ml_utils
+
 
 def reset_random_seeds(seed):
     # currently not used
@@ -89,13 +91,35 @@ if __name__ == "__main__":
     if Path(temp_save_dir).is_dir():
         autoencoder = tf.keras.models.load_model(temp_save_dir)
     else:
+
         with open('cards.json', 'r', encoding="utf-8") as cardsjson:
             cards = json.load(cardsjson)
-            cards = [cards.get(int_to_card[i], "") for i in range(num_cards)]
-            for card in cards:
-                if "otherParses" in card:
-                    del card["otherParses"]
-        autoencoder = CC_Recommender(cards, max_cube_size)
+        cards = [cards.get(int_to_card[i], "") for i in range(num_cards)]
+        for card in cards:
+            if "otherParses" in card:
+                del card["otherParses"]
+        all_paths, vocab_count = ml_utils.generate_paths(cards, return_vocab_count=True)
+        our_paths = []
+        for a in all_paths:
+            a += [[0 for _ in range(ml_utils.MAX_PATH_LENGTH)]
+                  for _ in range(len(a), ml_utils.NUM_INPUT_PATHS)]
+            np.random.shuffle(a)
+            a = a[:ml_utils.NUM_INPUT_PATHS]
+            our_paths.append(a)
+        print('loading model')
+        card_model = CardEncoderWrapper(vocab_count, ml_utils.NUM_INPUT_PATHS,
+                                        ml_utils.MAX_PATH_LENGTH)
+        latest = tf.train.latest_checkpoint('ml_files/')
+        card_model.load_weights(latest)
+        print('Looking up embeddings')
+        STRIDE = 512
+        embeddings = []
+        for i in range(1, len(all_paths), STRIDE):
+            cur_paths = tf.constant(our_paths[i:i + STRIDE])
+            card_embeddings = card_model.card_encoder(cur_paths)
+            embeddings.append(card_embeddings)
+        card_embeddings = tf.concat(embeddings, 0).numpy()
+        autoencoder = CC_Recommender(cards, max_cube_size, card_embeddings)
         autoencoder.run_eagerly = True
         autoencoder.compile(
             optimizer='adam',
@@ -103,7 +127,7 @@ if __name__ == "__main__":
             loss_weights=[1.0, reg],
             metrics=['accuracy'],
         )
-        autoencoder.fit(generator, epochs=1) # , use_multiprocessing=True)
+        autoencoder.fit(generator, epochs=1)
         Path(temp_save_dir).mkdir(parents=True, exist_ok=True)
         autoencoder.save(temp_save_dir)
         print("Saved initial model")

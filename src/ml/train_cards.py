@@ -57,7 +57,7 @@ if __name__ == "__main__":
         data_path='././output/card_generator_data.json',
     )
     print('Setting Up Model . . . \n')
-    autoencoder = CardEncoderWrapper(generator.vocab_count, generator.max_paths, generator.max_path_length)
+    autoencoder = CardEncoderWrapper(generator.vocab_dict, generator.max_paths, generator.max_path_length)
     autoencoder.run_eagerly = True
     autoencoder.compile(
         optimizer='adam',

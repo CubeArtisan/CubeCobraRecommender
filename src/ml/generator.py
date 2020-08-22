@@ -1,17 +1,17 @@
 from bisect import bisect_left
-from collections import Counter, defaultdict
-from typing import Dict, List, Tuple, Union
+from collections import Counter
 
+import numpy as np
+import tensorflow as tf
 from tensorflow.keras.utils import Sequence
 from tensorflow.keras.preprocessing.sequence import skipgrams
-import numpy as np
-import random
+
+from ml.ml_utils import generate_card_structures, generate_paths, MAX_PATH_LENGTH, NUM_INPUT_PATHS
 
 WINDOW_SIZE = 4
-MAX_PATH_LENGTH = 16
-NUM_INPUT_PATHS = 16
-NUM_PATHS = 512
-NUM_EXAMPLES = 2**21
+NUM_EXAMPLES = 2**18
+NUM_START_POS = 10000
+IDENTITY_EXAMPLES_DIVISOR = 20
 
 
 class DataGenerator(Sequence):
@@ -113,7 +113,7 @@ class DataGenerator(Sequence):
         neg_samplers = [self.neg_samplers[i] for i in main_indices]
         x_regularization = np.zeros((len(reg_indices), self.max_cube_size)).astype(int)        
         for i, x in enumerate(reg_indices):
-            x_regularization[i, 0] = x
+            x_regularization[i, np.random.randint(self.max_cube_size)] = x
         y_regularization = self.y_reg[reg_indices]
         y_cubes = np.zeros((len(main_indices), self.N_cards))
 
@@ -141,7 +141,7 @@ class DataGenerator(Sequence):
             actual_cube = []
             for key, count in new_cube.items():
                 actual_cube += [key for _ in range(count)]
-            random.shuffle(actual_cube)
+            np.random.shuffle(actual_cube)
             for idx in cube:
                 if idx > 0 and idx not in y_flip_include:
                     y_cubes[i, idx - 1] = 1
@@ -152,73 +152,12 @@ class DataGenerator(Sequence):
 
 
 def get_cumulative_dist(dist):
-    acc = 0
-    result = []
-    for prob in dist:
-        acc += prob
-        result.append(acc)
-    return result
+    return np.cumsum(dist)
 
 
 def sample_index_from_cumulative(cum_dist):
     value = np.random.rand()
     return bisect_left(cum_dist, value)
-
-
-def convert_structure(structure: Union[list, dict, int, str, bool],
-                      key: str, vocab_dict: Dict[str, int],
-                      children: List[List[int]],
-                      node_labels: List[int],
-                      node_heights: List[int],
-                      node_depths: List[int],
-                      depth: int) -> Tuple[int, int]:
-    our_children = []
-    max_child_height = 0
-    if isinstance(structure, list):
-        for index, child in enumerate(structure):
-            child_index, height = convert_structure(child, str(index),
-                                                    vocab_dict, children,
-                                                    node_labels, node_heights,
-                                                    node_depths, depth + 1)
-            our_children.append(child_index)
-            max_child_height = max(max_child_height, height)
-    elif isinstance(structure, dict):
-        for key, child in structure.items():
-            child_index, height = convert_structure(child, key, vocab_dict,
-                                                    children, node_labels, node_heights,
-                                                    node_depths, depth + 1)
-            our_children.append(child_index)
-            max_child_height = max(max_child_height, height)
-    else:
-        key = f'{key}.{structure}'
-        if key in vocab_dict:
-            vocab = vocab_dict[key]
-        else:
-            vocab = len(vocab_dict)
-            vocab_dict[key] = vocab
-        our_index = len(node_labels)
-        node_labels.append(vocab)
-        node_heights.append(0)
-        for index in range(len(children)):
-            children[index].append(0)
-        node_depths.append(depth)
-        return our_index, 0
-    if key in vocab_dict:
-        vocab = vocab_dict[key]
-    else:
-        vocab = len(vocab_dict)
-        vocab_dict[key] = vocab
-    for _ in range(len(structure), len(children)):
-        our_children.append(-1)
-    our_index = len(node_labels)
-    for index, child_index in enumerate(our_children):
-        if len(children) <= index:
-            children.append([0 for _ in node_labels])
-        children[index].append(0)
-    node_labels.append(vocab)
-    node_heights.append(max_child_height + 1)
-    node_depths.append(depth)
-    return our_index, max_child_height + 1
 
 
 class CardDataGenerator(Sequence):
@@ -233,51 +172,36 @@ class CardDataGenerator(Sequence):
         card_counts = np.concatenate(([0], card_counts))
         card_counts = card_counts / card_counts.sum()
         self.card_counts = get_cumulative_dist(card_counts)
+        self.all_paths, self.vocab_dict = generate_paths(cards, True)
+        print('Building adjacency graph structure.')
         y_mtx = adj_mtx.copy()
         np.fill_diagonal(y_mtx, 0)
-        y_mtx = (y_mtx / y_mtx.sum(1)[:, None])
+        y_mtx = y_mtx / y_mtx.sum(1)[:, None]
         self.y_probs = [[] for _ in range(self.num_cards + 1)]
         self.y_indices = [[] for _ in range(self.num_cards + 1)]
-        print('Building adjacency graph structure.')
         non_zero = np.where(y_mtx > 0)
         for i, j in zip(*non_zero):
             self.y_probs[i + 1].append(y_mtx[i][j])
             self.y_indices[i + 1].append(j + 1)
         self.y_probs = [get_cumulative_dist(probs) for probs in self.y_probs]
-        print('Converting cards to trees.')
-        vocab_dict = {"<unkown>": 0}
-        children = []
-        node_labels = [0]
-        self.card_indices = [0]
-        node_heights = [-1]
-        node_depths = [-1]
-        for card in cards:
-            card_index, _ = convert_structure(card, "", vocab_dict, children,
-                                              node_labels, node_heights, node_depths, 0)
-            self.card_indices.append(card_index)
-        self.node_labels = node_labels
-        self.node_heights = node_heights
-        self.node_depths = node_depths
-        children_count = len(children)
-        self.node_count = len(node_labels)
-        children = [[child[i] for child in children]
-                    for i in range(self.node_count)]
-        self.node_parents = [0 for _ in range(self.node_count)]
-        for i, our_children in enumerate(children):
-            for child in our_children:
-                if child != 0:
-                    self.node_parents[child] = i
-        self.vocab_count = len(vocab_dict)
-        print(len(vocab_dict), self.node_count, children_count)
-        self.all_paths = self.generate_paths()
+        print('Building inverse adjacency graph structure')
+        inv_y_mtx = 1 - y_mtx
+        np.fill_diagonal(inv_y_mtx, 0)
+        inv_y_mtx = inv_y_mtx / inv_y_mtx.sum(1)[:, None]
+        non_zero = np.where(inv_y_mtx > 0)
+        self.inv_y_probs = [[] for _ in range(self.num_cards + 1)]
+        self.inv_y_indices = [[] for _ in range(self.num_cards + 1)]
+        for i, j in zip(*non_zero):
+            self.inv_y_probs[i + 1].append(inv_y_mtx[i][j])
+            self.inv_y_indices[i + 1].append(j + 1)
+        self.inv_y_probs = [get_cumulative_dist(probs) for probs in self.inv_y_probs]
 
     def generate_data(self):
         print('Calculating walks.')
         positive_examples = [Counter() for _ in range(self.num_cards + 1)]
         negative_examples = [Counter() for _ in range(self.num_cards + 1)]
         for _ in range(self.num_walks):
-            examples = self.calculate_skipgrams()
-            for positive, negative in examples:
+            for positive, negative in self.calculate_skipgrams():
                 for i, j in positive:
                     positive_examples[i][j] += 1
                 for i, j in negative:
@@ -300,102 +224,51 @@ class CardDataGenerator(Sequence):
         for i, negative in enumerate(negative_examples):
             for j in list(negative.keys()):
                 del negative_examples[j][i]
-        return [(i, j, 1)
-                for i, positive in enumerate(positive_examples)
-                for j in positive.keys()] + [(i, j, 0)
-                                             for i, negative in enumerate(negative_examples)
-                                             for j in negative.keys()]
+        examples = [(i, j, 1)
+                    for i, positive in enumerate(positive_examples)
+                    for j, count in positive.items()
+                    for _ in range(count)] + [(i, j, 0)
+                                              for i, negative in enumerate(negative_examples)
+                                              for j, count in negative.items()
+                                              for _ in range(count)]
+        num_identity_examples = len(examples) // self.num_cards // IDENTITY_EXAMPLES_DIVISOR
+        examples += [(i, i, 1)
+                     for _ in range(num_identity_examples)
+                     for i in range(1, self.num_cards + 1)]
+        return examples
+
+    def do_walk(self, start_node, walk_len, probs, indices, num_cards):
+        walk = [start_node]
+        cur_node = start_node
+        for _ in range(walk_len):
+            sampling_table = probs[cur_node]
+            nodes = indices[cur_node]
+            node_index = sample_index_from_cumulative(sampling_table)
+            cur_node = nodes[node_index]
+            walk.append(cur_node)
+        couples, labels = skipgrams(walk, num_cards + 1, negative_samples=0.0,
+                                    window_size=WINDOW_SIZE)
+        for couple, label in zip(couples, labels):
+            if label == 1:
+                yield couple
+                yield couple[::-1]
 
     def calculate_skipgrams(self):
-        for i in range(1, self.num_cards + 1):
-            walk = [i]
-            cur_node = i
-            for _ in range(self.walk_len):
-                sampling_table = self.y_probs[cur_node]
-                nodes = self.y_indices[cur_node]
-                node_index = sample_index_from_cumulative(sampling_table)
-                cur_node = nodes[node_index]
-                walk.append(cur_node)
-            couples, labels = skipgrams(walk, self.num_cards + 1,
-                                        negative_samples=0.0,
-                                        window_size=WINDOW_SIZE)
-            positive = []
+        for _ in range(NUM_START_POS):
+            i = np.random.randint(1, self.num_cards + 1)
+            positive = self.do_walk(i, self.walk_len, self.y_probs, self.y_indices, self.num_cards)
+            positive = list(positive)
             negative = []
-            for couple, label in zip(couples, labels):
-                i, j = couple
-                i = int(i)
-                j = int(j)
-                if label == 1:
-                    positive.append((i, j))
-                    positive.append((j, i))
-                    neg_i = sample_index_from_cumulative(self.card_counts)
-                    negative.append((i, neg_i))
-                    negative.append((neg_i, i))
+            for i, pos in enumerate(positive):
+                j = pos[0]
+                sampling_table = self.inv_y_probs[j]
+                nodes = self.inv_y_indices[j]
+                node_index = sample_index_from_cumulative(sampling_table)
+                k = nodes[node_index]
+                negative.append((j, k))
+                negative.append((k, j))
             yield positive, negative
 
-    def generate_paths(self):
-        print('Calculating AST paths')
-        all_paths = [[]]
-        for i, max_index in enumerate(self.card_indices):
-            if i == 0:
-                continue
-            min_index = self.card_indices[i - 1] + 1
-            paths = []
-            index_range = [x for x in range(min_index, max_index) if self.node_heights[x] == 0]
-            computed_values = defaultdict(lambda: defaultdict(lambda: False))
-            used_indices = set()
-            iterations = 0
-            if len(index_range) == 0:
-                all_paths.append([])
-                continue
-            while len(paths) < NUM_PATHS and iterations < NUM_PATHS * 2:
-                iterations += 1
-                new_index_range = [x for x in index_range if x not in used_indices]
-                if len(new_index_range) > 0:
-                    start = random.choice(new_index_range)
-                else:
-                    start = random.choice(index_range)
-                remaining = [x for x in index_range if x != start and not computed_values[start][x]]
-
-                if len(remaining) == 0:
-                    continue
-                new_remaining = [x for x in remaining if x not in used_indices]
-                if len(new_remaining) > 0:
-                    end = random.choice(new_remaining)
-                else:
-                    end = random.choice(remaining)
-                used_indices.add(start)
-                used_indices.add(end)
-                computed_values[start][end] = True
-                computed_values[end][start] = True
-                start_depth = self.node_depths[start]
-                end_depth = self.node_depths[end]
-                if end_depth > start_depth:
-                    start, end = end, start
-                    start_depth, end_depth = end_depth, start_depth
-                path = [self.node_labels[start]]
-                end_path = [self.node_labels[end]]
-                while start_depth > end_depth:
-                    start = self.node_parents[start]
-                    start_depth -= 1
-                    path.append(start)
-                while self.node_parents[start] != self.node_parents[end]:
-                    start = self.node_parents[start]
-                    end = self.node_parents[end]
-                    path.append(start)
-                    end_path.append(end)
-                path.append(self.node_parents[start])
-                path += end_path[::-1]
-                if len(path) > MAX_PATH_LENGTH:
-                    continue
-                paths.append(path)
-            all_paths.append(paths)
-        for node_paths in all_paths:
-            for path in node_paths:
-                for _ in range(len(path), MAX_PATH_LENGTH):
-                    path.append(0)
-        return all_paths
-            
     def __len__(self):
         self.data = self.generate_data()
         np.random.shuffle(self.data)
@@ -409,13 +282,13 @@ class CardDataGenerator(Sequence):
         for i in range(self.batch_size):
             a, b, y = self.data[self.batch_size * item + i]
             a = self.all_paths[a]
+            a += [[0 for _ in range(MAX_PATH_LENGTH)] for _ in range(len(a), NUM_INPUT_PATHS)]
             np.random.shuffle(a)
             a = a[:NUM_INPUT_PATHS]
-            a += [[0 for _ in range(MAX_PATH_LENGTH)] for _ in range(len(a), NUM_INPUT_PATHS)]
             b = self.all_paths[b]
+            b += [[0 for _ in range(MAX_PATH_LENGTH)] for _ in range(len(b), NUM_INPUT_PATHS)]
             np.random.shuffle(b)
             b = b[:NUM_INPUT_PATHS]
-            b += [[0 for _ in range(MAX_PATH_LENGTH)] for _ in range(len(b), NUM_INPUT_PATHS)]
             a_s.append(a)
             b_s.append(b)
             y_s.append(y)
@@ -424,4 +297,6 @@ class CardDataGenerator(Sequence):
         b_s = np.array(b_s).reshape((self.batch_size, 1, NUM_INPUT_PATHS, MAX_PATH_LENGTH))
         x_s = np.concatenate((a_s, b_s), 1)
         y_s = np.array(y_s).reshape((self.batch_size, 1))
+        # x_s = tf.convert_to_tensor(x_s)
+        # y_s = tf.convert_to_tensor(y_s)
         return x_s, y_s
