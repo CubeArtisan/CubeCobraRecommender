@@ -14,6 +14,7 @@ if __name__ == "__main__":
 
 from generator import CardDataGenerator
 from model import CardEncoderWrapper
+from metrics import FilteredBinaryAccuracy
 from non_ml import utils
 
 if __name__ == "__main__":
@@ -54,7 +55,7 @@ if __name__ == "__main__":
         card_counts,
         cards,
         batch_size=batch_size,
-        data_path='././output/card_generator_data.json',
+        data_path='././output/',
     )
     print('Setting Up Model . . . \n')
     autoencoder = CardEncoderWrapper(generator.vocab_dict, generator.max_paths, generator.max_path_length)
@@ -63,9 +64,12 @@ if __name__ == "__main__":
         optimizer='adam',
         loss=['binary_crossentropy'],
         loss_weights=[1.0],
-        metrics=['accuracy'],
+        metrics=['accuracy', 'binary_accuracy', FilteredBinaryAccuracy(True, 'true_accuracy'),
+                 FilteredBinaryAccuracy(False, 'false_accuracy')],
     )
-
+    latest = tf.train.latest_checkpoint(output_dir)
+    if latest is not None:
+        autoencoder.load_weights(latest)
     # pdb.set_trace()
     cp_callback = tf.keras.callbacks.ModelCheckpoint(
         filepath=output_dir,

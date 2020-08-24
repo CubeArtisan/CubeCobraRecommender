@@ -70,9 +70,8 @@ dist_f = CosineSimilarity()
 idx = card_to_int[name]
 print('calculating similiarities')
 dists = np.array([
-    dist_f(card_embeddings[idx], x).numpy() for x in card_embeddings
+    np.absolute(dist_f(card_embeddings[idx], x).numpy()) for x in card_embeddings
 ])
-
 ranked = dists.argsort()
 
 for i in range(N):

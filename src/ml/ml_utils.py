@@ -123,7 +123,6 @@ def generate_card_structures(cards):
 def generate_paths(cards, return_vocab_count=False):
     card_indices, node_depths, node_heights, node_labels, vocab_count, node_parents = \
         generate_card_structures(cards)
-    print(node_labels)
     print('Calculating AST paths')
     all_paths = [[]]
     for i, max_index in enumerate(card_indices):

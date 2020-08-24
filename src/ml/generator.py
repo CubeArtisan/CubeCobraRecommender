@@ -260,6 +260,8 @@ class CardDataGenerator(Sequence):
             positive = list(positive)
             negative = []
             for i, pos in enumerate(positive):
+                if i % 2 == 0:
+                    continue
                 j = pos[0]
                 sampling_table = self.inv_y_probs[j]
                 nodes = self.inv_y_indices[j]
