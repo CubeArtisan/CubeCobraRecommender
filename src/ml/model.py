@@ -25,8 +25,10 @@ Epochs: 100
 
 Batch Size: 64
 """
-RNN_SIZE = 512
+CNN_SIZE = 16
+CNN_WINDOW_SIZE = 4
 EMBED_SIZE = 64
+PATH_EMBED_SIZE = 256
 CARD_EMBED_SIZE = 256
 
 
@@ -34,40 +36,47 @@ class CardEncoder(Model):
     """
     Encode cards to vectors
     """
-    def __init__(self, name, vocab_dict, max_paths, max_path_length):
+    def __init__(self, name, vocab_dict, max_paths, max_path_length, width, feature_count):
         super().__init__()
         self.assigned_name = name
         self.max_paths = max_paths
         self.max_path_length = max_path_length
+        self.width = width
+        self.feature_count = feature_count
+        self.cnn = tf.keras.layers.Conv2D(CNN_SIZE, (CNN_WINDOW_SIZE, 300))
         embedding_tensor = [0 for _ in range(len(vocab_dict))]
         for index, embedding in vocab_dict.values():
             embedding_tensor[index] = embedding.astype(np.float32)
         embedding_tensor = tf.convert_to_tensor(embedding_tensor)
+        self.dropout = tf.keras.layers.Dropout(0.25, name='path_dropout')
+        self.flatten = tf.keras.layers.Flatten()
         self.embedding_tensor = tf.Variable(embedding_tensor)
-        self.rnn_cell = tf.keras.layers.LSTMCell(RNN_SIZE // 2)
-        self.rnn = tf.keras.layers.Bidirectional(
-            layer=tf.keras.layers.RNN(self.rnn_cell, return_state=True),
-            backward_layer=tf.keras.layers.RNN(self.rnn_cell, go_backwards=True,
-                                               return_state=True),
-            merge_mode="concat",
-            name=self.assigned_name + "_bidirectional",
-            dtype=tf.float32)
-        self.embed_dense = Dense(CARD_EMBED_SIZE, activation="tanh")
-        self.time_distributed = tf.keras.layers.TimeDistributed(self.embed_dense,
-                                                                name=self.assigned_name
-                                                                     + "_time_distributed")
+        self.embed_paths = Dense(PATH_EMBED_SIZE, activation="tanh")
+        self.embed_dense = Dense(CARD_EMBED_SIZE, activation="relu")
         self.attention_layer = AttentionLayer(name=self.assigned_name + "_attention")
         print('preprocessed cards')
 
     def call(self, x, training=None, mask=None):
-        all_paths_embed = tf.gather(self.embedding_tensor, x)
-        flat_paths_embed = tf.reshape(all_paths_embed, [-1, self.max_path_length, 300])
-        _, state_fw, _, state_bw, _ = self.rnn(inputs=flat_paths_embed)
-        final_rnn_state = tf.concat([state_fw, state_bw], -1)
-        by_card = tf.reshape(final_rnn_state, [-1, self.max_paths, RNN_SIZE])
-        by_card_dense = self.time_distributed(by_card)
-        code_vectors, attention_weights = self.attention_layer([by_card_dense])
-        return code_vectors
+        paths, features = x
+        batch_size = tf.shape(paths)[0]
+        features_embed = tf.gather(self.embedding_tensor, features) # batch_size, width, feature_count, 300
+        features_embed = tf.reshape(features_embed, (batch_size, self.width, 300 * self.feature_count))
+        all_paths_embed = tf.gather(self.embedding_tensor, paths) # batch_size, width, max_paths, max_path_length, 300
+        flat_paths_embed = tf.reshape(all_paths_embed, [batch_size * self.max_paths * self.width,
+                                                        self.max_path_length, 300, 1])
+        final_cnn_state = self.cnn(flat_paths_embed)
+        flattened_cnn_state = self.flatten(final_cnn_state)
+        print(tf.shape(flattened_cnn_state))
+        flattened_dropout = self.dropout(flattened_cnn_state, training=training)
+        flattened_dense = self.embed_paths(flattened_dropout)
+        by_card = tf.reshape(flattened_dense,
+                             (batch_size * self.width, self.max_paths, PATH_EMBED_SIZE))
+        code_vectors, attention_weights = self.attention_layer([by_card])
+        code_vectors = tf.reshape(code_vectors, (batch_size, self.width, PATH_EMBED_SIZE))
+        with_features = tf.concat([code_vectors, features_embed], 2)
+        embedded = self.embed_dense(with_features)
+        embedded_normalized = tf.math.l2_normalize(embedded, 2)
+        return embedded_normalized
 
 
 class Encoder(Model):

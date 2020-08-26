@@ -2,16 +2,15 @@ from bisect import bisect_left
 from collections import Counter
 
 import numpy as np
-import tensorflow as tf
 from tensorflow.keras.utils import Sequence
 from tensorflow.keras.preprocessing.sequence import skipgrams
 
-from ml.ml_utils import generate_card_structures, generate_paths, MAX_PATH_LENGTH, NUM_INPUT_PATHS
+from ml.ml_utils import generate_paths, MAX_PATH_LENGTH, NUM_INPUT_PATHS
 
 WINDOW_SIZE = 4
-NUM_EXAMPLES = 2**18
+NUM_EXAMPLES = 2**16
 NUM_START_POS = 10000
-IDENTITY_EXAMPLES_DIVISOR = 20
+IDENTITY_EXAMPLES_DIVISOR = 10
 
 
 class DataGenerator(Sequence):
@@ -161,7 +160,7 @@ def sample_index_from_cumulative(cum_dist):
 
 
 class CardDataGenerator(Sequence):
-    def __init__(self, adj_mtx, walk_len, card_counts, cards, batch_size, data_path=None):
+    def __init__(self, adj_mtx, walk_len, card_counts, cards, batch_size, example_count):
         super(CardDataGenerator).__init__()
         self.num_cards = adj_mtx.shape[0]
         self.batch_size = batch_size
@@ -169,10 +168,12 @@ class CardDataGenerator(Sequence):
         self.num_walks = 1
         self.max_paths = NUM_INPUT_PATHS
         self.max_path_length = MAX_PATH_LENGTH
-        card_counts = np.concatenate(([0], card_counts))
-        card_counts = card_counts / card_counts.sum()
-        self.card_counts = get_cumulative_dist(card_counts)
-        self.all_paths, self.vocab_dict = generate_paths(cards, True)
+        self.example_count = example_count
+        self.all_paths, self.card_features, self.feature_count, self.vocab_dict = generate_paths(cards)
+        print(len(self.card_features[0]), self.feature_count)
+        for features in self.card_features:
+            if len(features) != self.feature_count:
+                print("mismatched feature length")
         print('Building adjacency graph structure.')
         y_mtx = adj_mtx.copy()
         np.fill_diagonal(y_mtx, 0)
@@ -185,7 +186,7 @@ class CardDataGenerator(Sequence):
             self.y_indices[i + 1].append(j + 1)
         self.y_probs = [get_cumulative_dist(probs) for probs in self.y_probs]
         print('Building inverse adjacency graph structure')
-        inv_y_mtx = 1 - y_mtx
+        inv_y_mtx = (1 - y_mtx) * card_counts
         np.fill_diagonal(inv_y_mtx, 0)
         inv_y_mtx = inv_y_mtx / inv_y_mtx.sum(1)[:, None]
         non_zero = np.where(inv_y_mtx > 0)
@@ -195,47 +196,12 @@ class CardDataGenerator(Sequence):
             self.inv_y_probs[i + 1].append(inv_y_mtx[i][j])
             self.inv_y_indices[i + 1].append(j + 1)
         self.inv_y_probs = [get_cumulative_dist(probs) for probs in self.inv_y_probs]
+        # self.inv_y_probs = self.y_probs
+        # self.inv_y_indices = self.y_indices
 
     def generate_data(self):
         print('Calculating walks.')
-        positive_examples = [Counter() for _ in range(self.num_cards + 1)]
-        negative_examples = [Counter() for _ in range(self.num_cards + 1)]
-        for _ in range(self.num_walks):
-            for positive, negative in self.calculate_skipgrams():
-                for i, j in positive:
-                    positive_examples[i][j] += 1
-                for i, j in negative:
-                    negative_examples[i][j] += 1
-        for positive, negative in zip(positive_examples, negative_examples):
-            for key in list(positive.keys()):
-                if key in negative:
-                    if positive[key] > negative[key]:
-                        del negative[key]
-                    else:
-                        del positive[key]
-        for i, positive in enumerate(positive_examples):
-            for j in list(positive.keys()):
-                del positive_examples[j][i]
-                if i in negative_examples[j]:
-                    if positive[j] > negative_examples[j][i]:
-                        del negative_examples[j][i]
-                    else:
-                        del positive_examples[i][j]
-        for i, negative in enumerate(negative_examples):
-            for j in list(negative.keys()):
-                del negative_examples[j][i]
-        examples = [(i, j, 1)
-                    for i, positive in enumerate(positive_examples)
-                    for j, count in positive.items()
-                    for _ in range(count)] + [(i, j, 0)
-                                              for i, negative in enumerate(negative_examples)
-                                              for j, count in negative.items()
-                                              for _ in range(count)]
-        num_identity_examples = len(examples) // self.num_cards // IDENTITY_EXAMPLES_DIVISOR
-        examples += [(i, i, 1)
-                     for _ in range(num_identity_examples)
-                     for i in range(1, self.num_cards + 1)]
-        return examples
+        return list(self.calculate_skipgrams())
 
     def do_walk(self, start_node, walk_len, probs, indices, num_cards):
         walk = [start_node]
@@ -251,25 +217,22 @@ class CardDataGenerator(Sequence):
         for couple, label in zip(couples, labels):
             if label == 1:
                 yield couple
-                yield couple[::-1]
 
     def calculate_skipgrams(self):
         for _ in range(NUM_START_POS):
             i = np.random.randint(1, self.num_cards + 1)
             positive = self.do_walk(i, self.walk_len, self.y_probs, self.y_indices, self.num_cards)
-            positive = list(positive)
-            negative = []
             for i, pos in enumerate(positive):
-                if i % 2 == 0:
-                    continue
                 j = pos[0]
-                sampling_table = self.inv_y_probs[j]
-                nodes = self.inv_y_indices[j]
-                node_index = sample_index_from_cumulative(sampling_table)
-                k = nodes[node_index]
-                negative.append((j, k))
-                negative.append((k, j))
-            yield positive, negative
+                if i % IDENTITY_EXAMPLES_DIVISOR == 0:
+                    pos = [j, j]
+                for _ in range(self.example_count - 1):
+                    sampling_table = self.inv_y_probs[j]
+                    nodes = self.inv_y_indices[j]
+                    node_index = sample_index_from_cumulative(sampling_table)
+                    k = nodes[node_index]
+                    pos.append(k)
+                yield pos
 
     def __len__(self):
         self.data = self.generate_data()
@@ -277,28 +240,19 @@ class CardDataGenerator(Sequence):
         self.data = self.data[:NUM_EXAMPLES]
         return len(self.data) // self.batch_size
 
+    def retrieve_card_paths(self, index):
+        paths = self.all_paths[index]
+        np.random.shuffle(paths)
+        return paths[:NUM_INPUT_PATHS]
+
     def __getitem__(self, item):
-        a_s = []
-        b_s = []
-        y_s = []
-        for i in range(self.batch_size):
-            a, b, y = self.data[self.batch_size * item + i]
-            a = self.all_paths[a]
-            a += [[0 for _ in range(MAX_PATH_LENGTH)] for _ in range(len(a), NUM_INPUT_PATHS)]
-            np.random.shuffle(a)
-            a = a[:NUM_INPUT_PATHS]
-            b = self.all_paths[b]
-            b += [[0 for _ in range(MAX_PATH_LENGTH)] for _ in range(len(b), NUM_INPUT_PATHS)]
-            np.random.shuffle(b)
-            b = b[:NUM_INPUT_PATHS]
-            a_s.append(a)
-            b_s.append(b)
-            y_s.append(y)
-            
-        a_s = np.array(a_s).reshape((self.batch_size, 1, NUM_INPUT_PATHS, MAX_PATH_LENGTH))
-        b_s = np.array(b_s).reshape((self.batch_size, 1, NUM_INPUT_PATHS, MAX_PATH_LENGTH))
-        x_s = np.concatenate((a_s, b_s), 1)
-        y_s = np.array(y_s).reshape((self.batch_size, 1))
-        # x_s = tf.convert_to_tensor(x_s)
-        # y_s = tf.convert_to_tensor(y_s)
-        return x_s, y_s
+        paths = [[self.retrieve_card_paths(example)  # MAX_PATHS, MAX_PATH_LENGTH
+                  for example in examples]  # EXAMPLE_COUNT, MAX_PATHS, MAX_PATH_LENGTH
+                 for examples in self.data[self.batch_size * item: self.batch_size * (item + 1)]]  # BATCH_SIZE, EXAMPLE_COUNT, MAX_PATHS, MAX_PATH_LENGTH
+        features = [[self.card_features[example]  # FEATURE_COUNT
+                     for example in examples]  # EXAMPLE_COUNT, FEATURE_COUNT
+                    for examples in self.data[self.batch_size * item: self.batch_size * (item + 1)]] # BATCH_SIZE, EXAMPLE_COUNT, FEATURE_COUNT
+        paths = np.array(paths)
+        features = np.array(features).reshape((self.batch_size, self.example_count + 1, self.feature_count, 1))
+        y_s = np.zeros_like(features)
+        return [paths, features], y_s

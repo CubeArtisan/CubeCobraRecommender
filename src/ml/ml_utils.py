@@ -50,7 +50,6 @@ def convert_structure(structure: Union[list, dict, int, str, bool],
             our_children.append(child_index)
             max_child_height = max(max_child_height, height)
     else:
-        key = f'{key}.{structure}'
         if key in vocab_dict:
             vocab, _ = vocab_dict[key]
         else:
@@ -63,13 +62,34 @@ def convert_structure(structure: Union[list, dict, int, str, bool],
             if len(components) > 0:
                 vector =  vector / len(components)
             vocab_dict[key] = vocab, vector
-        our_index = len(node_labels)
+        key_index = len(node_labels)
+        node_heights.append(1)
+        if len(children) < 1:
+            children.append([0 for _ in node_labels])
+        children[0].append(vocab)
+        for child in children[1:]:
+            child.append(0)
+        node_labels.append(vocab)
+        node_depths.append(depth)
+        key = str(structure)
+        if key in vocab_dict:
+            vocab, _ = vocab_dict[key]
+        else:
+            vocab = len(vocab_dict)
+            components = full_split(key)
+            components = nlp(' '.join(components))
+            vector = np.zeros((300,))
+            for component in components:
+                vector += component.vector
+            if len(components) > 0:
+                vector = vector / len(components)
+            vocab_dict[key] = vocab, vector
         node_labels.append(vocab)
         node_heights.append(0)
         for index in range(len(children)):
             children[index].append(0)
-        node_depths.append(depth)
-        return our_index, 0
+        node_depths.append(depth + 1)
+        return key_index, 0
     if key in vocab_dict:
         vocab, _ = vocab_dict[key]
     else:
@@ -88,7 +108,7 @@ def convert_structure(structure: Union[list, dict, int, str, bool],
     for index, child_index in enumerate(our_children):
         if len(children) <= index:
             children.append([0 for _ in node_labels])
-        children[index].append(0)
+        children[index].append(child_index)
     node_labels.append(vocab)
     node_heights.append(max_child_height + 1)
     node_depths.append(depth)
@@ -103,11 +123,44 @@ def generate_card_structures(cards):
     card_indices = [0]
     node_heights = [-1]
     node_depths = [-1]
+    card_features = [{}]
+    card_feature_names = defaultdict(lambda: 0)
+
+    def get_vocab_value(value):
+        if value not in vocab_dict:
+            vocab = len(vocab_dict)
+            components = full_split(value)
+            components = nlp(' '.join(components))
+            vector = np.zeros((300,))
+            for component in components:
+                vector += component.vector
+            if len(components) > 0:
+                vector = vector / len(components)
+            vocab_dict[value] = vocab, vector
+        vocab, _ = vocab_dict[value]
+        return vocab
     for card in cards:
+        features = {}
+        if isinstance(card, dict):
+            for key, value in card.items():
+                if key != "parsed":
+                    if isinstance(value, list):
+                        features[key] = [get_vocab_value(str(v)) for v in value]
+                    else:
+                        features[key] = [get_vocab_value(str(value))]
+                    card_feature_names[key] = max(card_feature_names[key], len(features[key]))
+            card = card.get("parsed", "")
         card_index, _ = convert_structure(card, "", vocab_dict, children,
                                           node_labels, node_heights, node_depths, 0)
         card_indices.append(card_index)
-    node_depths = node_depths
+        card_features.append(features)
+    card_feature_names = list(card_feature_names.items())
+    card_features = [[features.get(name, []) + [0 for _ in range(len(features.get(name, [])), count)]
+                      for name, count in card_feature_names]
+                     for features in card_features]
+    print(card_feature_names)
+    card_features = [[value for feature_value in features for value in feature_value]
+                     for features in card_features]
     children_count = len(children)
     children = [[child[i] for child in children]
                 for i in range(len(node_labels))]
@@ -116,12 +169,14 @@ def generate_card_structures(cards):
         for child in our_children:
             if child != 0:
                 node_parents[child] = i
-    print(len(vocab_dict), len(node_labels), children_count)
-    return card_indices, node_depths, node_heights, node_labels, vocab_dict, node_parents
+    feature_count = len(card_features[0])
+    print(len(vocab_dict), len(node_labels), children_count, max(node_depths), feature_count)
+    return card_indices, node_depths, node_heights, node_labels, vocab_dict, node_parents, \
+        card_features, feature_count
 
 
-def generate_paths(cards, return_vocab_count=False):
-    card_indices, node_depths, node_heights, node_labels, vocab_count, node_parents = \
+def generate_paths(cards):
+    card_indices, node_depths, node_heights, node_labels, vocab_dict, node_parents, card_features, feature_count = \
         generate_card_structures(cards)
     print('Calculating AST paths')
     all_paths = [[]]
@@ -183,7 +238,7 @@ def generate_paths(cards, return_vocab_count=False):
         for path in node_paths:
             for _ in range(len(path), MAX_PATH_LENGTH):
                 path.append(0)
-    if return_vocab_count:
-        return all_paths, vocab_count
-    else:
-        return all_paths
+        for _ in range(len(node_paths), NUM_INPUT_PATHS):
+            node_paths.append([0 for _ in range(MAX_PATH_LENGTH)])
+
+    return all_paths, card_features, feature_count, vocab_dict
