@@ -33,27 +33,33 @@ class FilteredBinaryAccuracy(tf.keras.metrics.Metric):
 
 
 class TripletFilteredAccuracy(tf.keras.metrics.Metric):
-    def __init__(self, filter_value, name, **kwargs):
+    def __init__(self, filter_value, margin, name, **kwargs):
         super(TripletFilteredAccuracy, self).__init__(name=name, **kwargs)
         self.count = self.add_weight(name='count', initializer='zeros')
         self.filtered_accurate = self.add_weight(name='filtered_accurate', initializer='zeros')
         self.filter_value = filter_value
+        self.margin = margin
 
     def update_state(self, y_true, y_pred, sample_weight=None):
         a, b, c = tf.unstack(y_pred, num=3, axis=1)
-        if self.filter_value:
-            ab = tf.reshape(tf.norm(tf.subtract(a, b), axis=1), (-1,))
-            counts = tf.ones_like(ab, dtype=tf.float32)
-            expectations = tf.less(ab, 0.2)
+        ab = tf.reshape(tf.norm(tf.subtract(a, b), axis=1), (-1, 1))
+        ac = tf.reshape(tf.norm(tf.subtract(a, c), axis=1), (-1, 1))
+        pos_expectations = tf.less(ab, self.margin)
+        neg_expectations = tf.greater(ac, self.margin)
+        if self.filter_value is None:
+            expectations = tf.concat([pos_expectations, neg_expectations], axis=1)
+        elif self.filter_value:
+            expectations = pos_expectations
         else:
-            ac = tf.reshape(tf.norm(tf.subtract(a, c), axis=1), (-1,))
-            counts = tf.ones_like(ac, dtype=tf.float32)
-            expectations = tf.greater(ac, 0.2)
+            expectations = neg_expectations
+        counts = tf.ones_like(expectations, dtype=tf.float32)
         expectations = tf.cast(expectations, "float32")
-        if sample_weight is not None:
-            sample_weight = tf.cast(sample_weight, "float32")
-            expectations = tf.multiply(expectations, sample_weight)
-            counts = tf.multiply(counts, sample_weight)
+        # if sample_weight is not None:
+        #     sample_weight = tf.cast(sample_weight, "float32")
+        #     expectations = tf.multiply(expectations, sample_weight)
+        #     counts = tf.multiply(counts, sample_weight)
+        counts = tf.reshape(counts, (-1,))
+        expectations = tf.reshape(expectations, (-1,))
         self.count.assign_add(tf.reduce_sum(counts))
         self.filtered_accurate.assign_add(tf.reduce_sum(expectations))
 
@@ -61,42 +67,14 @@ class TripletFilteredAccuracy(tf.keras.metrics.Metric):
         return tf.divide(self.filtered_accurate, self.count)
 
 
-class TripletAccuracy(tf.keras.metrics.Metric):
-    def __init__(self, name, **kwargs):
-        super(TripletAccuracy, self).__init__(name=name, **kwargs)
-        self.count = self.add_weight(name='count', initializer='zeros')
-        self.accurate = self.add_weight(name='accurate', initializer='zeros')
-
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        a, b, c = tf.unstack(y_pred, num=3, axis=1)
-        ab = tf.reshape(tf.norm(tf.subtract(a, b), axis=1), (-1,))
-        ac = tf.reshape(tf.norm(tf.subtract(a, c), axis=1), (-1,))
-        pos_expectations = tf.less(ab, 0.5)
-        neg_expectations = tf.greater(ac, 0.5)
-        pos_expectations = tf.cast(pos_expectations, "float32")
-        neg_expectations = tf.cast(neg_expectations, "float32")
-        counts = tf.fill(tf.shape(ab), 2.0)
-        counts = tf.cast(counts, "float32")
-        if sample_weight is not None:
-            sample_weight = tf.cast(sample_weight, "float32")
-            pos_expectations = tf.multiply(pos_expectations, sample_weight)
-            neg_expectations = tf.multiply(neg_expectations, sample_weight)
-            counts = tf.multiply(counts, sample_weight)
-        self.count.assign_add(tf.reduce_sum(counts))
-        self.accurate.assign_add(tf.reduce_sum(pos_expectations))
-        self.accurate.assign_add(tf.reduce_sum(neg_expectations))
-
-    def result(self):
-        return tf.divide(self.accurate, self.count)
-
-
 class ContrastiveFilteredAccuracy(tf.keras.metrics.Metric):
-    def __init__(self, filter_value, example_count, name, **kwargs):
+    def __init__(self, filter_value, example_count, cutoff_point, name, **kwargs):
         super(ContrastiveFilteredAccuracy, self).__init__(name=name, **kwargs)
         self.count = self.add_weight(name='count', initializer='zeros')
         self.filtered_accurate = self.add_weight(name='filtered_accurate', initializer='zeros')
         self.filter_value = filter_value
         self.example_count = example_count
+        self.cutoff_point = cutoff_point
 
     def update_state(self, y_true, y_pred, sample_weight=None):
         y_pred = tf.convert_to_tensor(y_pred)
@@ -106,8 +84,8 @@ class ContrastiveFilteredAccuracy(tf.keras.metrics.Metric):
         similarities = tf.reshape(tf.keras.layers.dot([a, examples], axes=2, normalize=True),
                                   (-1, self.example_count))
         pos, neg = tf.split(similarities, [1, self.example_count - 1], axis=1)
-        pos_expectation = tf.greater(pos, 0.5)
-        neg_expectation = tf.less(neg, 0.5)
+        pos_expectation = tf.greater(pos, self.cutoff_point)
+        neg_expectation = tf.less(neg, self.cutoff_point)
         if self.filter_value is None:
             expectations = tf.concat([pos_expectation, neg_expectation], 1)
         elif self.filter_value:

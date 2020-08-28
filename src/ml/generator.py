@@ -1,5 +1,7 @@
+import pickle
 from bisect import bisect_left
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 from tensorflow.keras.utils import Sequence
@@ -8,8 +10,7 @@ from tensorflow.keras.preprocessing.sequence import skipgrams
 from ml.ml_utils import generate_paths, MAX_PATH_LENGTH, NUM_INPUT_PATHS
 
 WINDOW_SIZE = 4
-NUM_EXAMPLES = 2**16
-NUM_START_POS = 10000
+NUM_EXAMPLES = 2**15
 IDENTITY_EXAMPLES_DIVISOR = 10
 
 
@@ -150,78 +151,104 @@ class DataGenerator(Sequence):
         return [(x_cubes, x_regularization), (y_cubes, y_regularization)]
 
 
-def get_cumulative_dist(dist):
-    return np.cumsum(dist)
-
-
 def sample_index_from_cumulative(cum_dist):
     value = np.random.rand()
     return bisect_left(cum_dist, value)
 
 
+def get_indices_probs(mtx, num_cards):
+    np.fill_diagonal(mtx, 0)
+    y_mtx = mtx / mtx.sum(1)[:, None]
+    y_probs = [[] for _ in range(num_cards + 1)]
+    y_indices = [[] for _ in range(num_cards + 1)]
+    non_zero = np.where(y_mtx > 0)
+    for i, j in zip(*non_zero):
+        y_probs[i + 1].append(y_mtx[i][j])
+        y_indices[i + 1].append(j + 1)
+    y_indices = [np.array(indices, dtype=np.int16) for indices in y_indices]
+    y_probs = [np.array(np.cumsum(probs), dtype=np.float32) for probs in y_probs]
+    return y_mtx, y_probs, y_indices
+
+
+def generate_y_probs(num_cards, data_path):
+    print('Building adjacency graph structure.')
+    adj_mtx = np.load(f'{data_path}/full_adj_mtx.npy')
+    y_mtx = adj_mtx.copy()
+    return get_indices_probs(y_mtx, num_cards)
+
+
+def generate_inv_y_probs(num_cards, y_mtx, data_path):
+    print('Building inverse adjacency graph structure')
+    card_counts = np.load(f'{data_path}/card_counts.npy')
+    inv_y_mtx = (1 - y_mtx) * card_counts
+    return get_indices_probs(inv_y_mtx, num_cards)[1:]
+
+
+def load_pickle_file(file_name):
+    with open(file_name, 'rb') as data_file:
+        return pickle.load(data_file)
+
+
+def get_cached_or_call(data_path, file_name, count, func, *args, **kwargs):
+    if all(Path(f'{data_path}/{file_name}.{i}').is_file() for i in range(count)):
+        print(f'Loading {file_name}')
+        data = (load_pickle_file(f'{data_path}/{file_name}.{i}') for i in range(count))
+    else:
+        data = func(*args, **kwargs)
+        print(f'Saving {file_name}')
+        for i in range(count):
+            with open(f'{data_path}/{file_name}.{i}', 'wb') as data_file:
+                pickle.dump(data[i], data_file)
+    return data
+
+
+def do_walk(start_node, walk_len, probs, indices, num_cards):
+    walk = [start_node]
+    cur_node = start_node
+    for _ in range(walk_len):
+        sampling_table = probs[cur_node]
+        nodes = indices[cur_node]
+        node_index = sample_index_from_cumulative(sampling_table)
+        cur_node = nodes[node_index]
+        walk.append(cur_node)
+    couples, labels = skipgrams(walk, num_cards + 1, negative_samples=0.0,
+                                window_size=WINDOW_SIZE)
+    for couple, label in zip(couples, labels):
+        if label == 1:
+            yield couple
+
+
 class CardDataGenerator(Sequence):
-    def __init__(self, adj_mtx, walk_len, card_counts, cards, batch_size, example_count):
+    def __init__(self, walk_len, cards, batch_size, example_count, data_path):
         super(CardDataGenerator).__init__()
-        self.num_cards = adj_mtx.shape[0]
+        self.num_cards = len(cards)
         self.batch_size = batch_size
         self.walk_len = walk_len
         self.num_walks = 1
         self.max_paths = NUM_INPUT_PATHS
         self.max_path_length = MAX_PATH_LENGTH
         self.example_count = example_count
-        self.all_paths, self.card_features, self.feature_count, self.vocab_dict = generate_paths(cards)
-        print(len(self.card_features[0]), self.feature_count)
-        for features in self.card_features:
-            if len(features) != self.feature_count:
-                print("mismatched feature length")
-        print('Building adjacency graph structure.')
-        y_mtx = adj_mtx.copy()
-        np.fill_diagonal(y_mtx, 0)
-        y_mtx = y_mtx / y_mtx.sum(1)[:, None]
-        self.y_probs = [[] for _ in range(self.num_cards + 1)]
-        self.y_indices = [[] for _ in range(self.num_cards + 1)]
-        non_zero = np.where(y_mtx > 0)
-        for i, j in zip(*non_zero):
-            self.y_probs[i + 1].append(y_mtx[i][j])
-            self.y_indices[i + 1].append(j + 1)
-        self.y_probs = [get_cumulative_dist(probs) for probs in self.y_probs]
-        print('Building inverse adjacency graph structure')
-        inv_y_mtx = (1 - y_mtx) * card_counts
-        np.fill_diagonal(inv_y_mtx, 0)
-        inv_y_mtx = inv_y_mtx / inv_y_mtx.sum(1)[:, None]
-        non_zero = np.where(inv_y_mtx > 0)
-        self.inv_y_probs = [[] for _ in range(self.num_cards + 1)]
-        self.inv_y_indices = [[] for _ in range(self.num_cards + 1)]
-        for i, j in zip(*non_zero):
-            self.inv_y_probs[i + 1].append(inv_y_mtx[i][j])
-            self.inv_y_indices[i + 1].append(j + 1)
-        self.inv_y_probs = [get_cumulative_dist(probs) for probs in self.inv_y_probs]
-        # self.inv_y_probs = self.y_probs
-        # self.inv_y_indices = self.y_indices
+        self.all_paths, self.continuous_features, self.continuous_features_count,\
+            self.categorical_features, self.categorical_features_count,\
+            self.vocab_dict = get_cached_or_call(data_path, 'generate_paths.pkl', 6, generate_paths,
+                                                 cards)
+        y_mtx, self.y_probs, self.y_indices = get_cached_or_call(data_path, 'y_mtx.pkl', 3,
+                                                                 generate_y_probs, self.num_cards,
+                                                                 data_path)
+        # pickle crashes with MemoryError trying to serialize self.inv_y_indices
+        # self.inv_y_probs, self.inv_y_indices = get_cached_or_call(data_path, 'inv_y_mtx.pkl', 2,
+        #                                                           generate_inv_y_probs,
+        #                                                           self.num_cards, y_mtx, data_path)
+        self.inv_y_probs, self.inv_y_indices = generate_inv_y_probs(self.num_cards, y_mtx, data_path)
 
     def generate_data(self):
         print('Calculating walks.')
         return list(self.calculate_skipgrams())
 
-    def do_walk(self, start_node, walk_len, probs, indices, num_cards):
-        walk = [start_node]
-        cur_node = start_node
-        for _ in range(walk_len):
-            sampling_table = probs[cur_node]
-            nodes = indices[cur_node]
-            node_index = sample_index_from_cumulative(sampling_table)
-            cur_node = nodes[node_index]
-            walk.append(cur_node)
-        couples, labels = skipgrams(walk, num_cards + 1, negative_samples=0.0,
-                                    window_size=WINDOW_SIZE)
-        for couple, label in zip(couples, labels):
-            if label == 1:
-                yield couple
-
     def calculate_skipgrams(self):
-        for _ in range(NUM_START_POS):
+        for _ in range(int(1.15 * NUM_EXAMPLES / (2* WINDOW_SIZE - 1) / (1 + self.walk_len))):
             i = np.random.randint(1, self.num_cards + 1)
-            positive = self.do_walk(i, self.walk_len, self.y_probs, self.y_indices, self.num_cards)
+            positive = do_walk(i, self.walk_len, self.y_probs, self.y_indices, self.num_cards)
             for i, pos in enumerate(positive):
                 j = pos[0]
                 if i % IDENTITY_EXAMPLES_DIVISOR == 0:
@@ -249,10 +276,16 @@ class CardDataGenerator(Sequence):
         paths = [[self.retrieve_card_paths(example)  # MAX_PATHS, MAX_PATH_LENGTH
                   for example in examples]  # EXAMPLE_COUNT, MAX_PATHS, MAX_PATH_LENGTH
                  for examples in self.data[self.batch_size * item: self.batch_size * (item + 1)]]  # BATCH_SIZE, EXAMPLE_COUNT, MAX_PATHS, MAX_PATH_LENGTH
-        features = [[self.card_features[example]  # FEATURE_COUNT
-                     for example in examples]  # EXAMPLE_COUNT, FEATURE_COUNT
-                    for examples in self.data[self.batch_size * item: self.batch_size * (item + 1)]] # BATCH_SIZE, EXAMPLE_COUNT, FEATURE_COUNT
+        continuous_features = [[self.continuous_features[example]  # CATEGORICAL_FEATURE_COUNT
+                     for example in examples]  # EXAMPLE_COUNT, CATEGORICAL_FEATURE_COUNT
+                    for examples in self.data[self.batch_size * item: self.batch_size * (item + 1)]]  # BATCH_SIZE, EXAMPLE_COUNT, CATEGORICAL_FEATURE_COUNT
+        categorical_features = [[self.categorical_features[example]  # CATEGORICAL_FEATURE_COUNT
+                     for example in examples]  # EXAMPLE_COUNT, CATEGORICAL_FEATURE_COUNT
+                    for examples in self.data[self.batch_size * item: self.batch_size * (item + 1)]]  # BATCH_SIZE, EXAMPLE_COUNT, CATEGORICAL_FEATURE_COUNT
         paths = np.array(paths)
-        features = np.array(features).reshape((self.batch_size, self.example_count + 1, self.feature_count, 1))
-        y_s = np.zeros_like(features)
-        return [paths, features], y_s
+        categorical_features = np.array(categorical_features)\
+            .reshape((self.batch_size, self.example_count + 1, self.categorical_features_count, 1))
+        continuous_features = np.array(continuous_features)\
+            .reshape((self.batch_size, self.example_count + 1, self.continuous_features_count, 1))
+        y_s = np.zeros_like(categorical_features)
+        return [paths, continuous_features, categorical_features], y_s

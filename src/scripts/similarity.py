@@ -8,6 +8,7 @@ if __name__ == "__main__":
     from os.path import dirname as dir
     sys.path.append(dir(sys.path[0]))
 
+from ml.generator import get_cached_or_call
 from ml.model import CardEncoder
 import non_ml.utils as utils
 import ml.ml_utils as ml_utils
@@ -44,7 +45,9 @@ for card in cards:
         del card['typeLine']
     if "otherParses" in card:
         del card["otherParses"]
-all_paths, features, feature_count, vocab_dict = ml_utils.generate_paths(cards)
+all_paths, continuous_features, continuous_count, categorical_features, categorical_count,\
+    vocab_dict = get_cached_or_call('./output', 'generate_paths.pkl', 6, ml_utils.generate_paths,
+                                    cards)
 print('shortening paths')
 our_paths = []
 for a in all_paths:
@@ -52,18 +55,20 @@ for a in all_paths:
     a = a[:ml_utils.NUM_INPUT_PATHS]
     our_paths.append(a)
 print('loading model')
-card_model = CardEncoder("card_encoder", vocab_dict, ml_utils.NUM_INPUT_PATHS, ml_utils.MAX_PATH_LENGTH, 1, feature_count)
-latest = tf.train.latest_checkpoint('ml_files/card_encoder_code2seq_contrastive')
-# latest = tf.train.latest_checkpoint('ml_files/card_encoder-code2seq-features')
+card_model = CardEncoder("card_encoder", vocab_dict, ml_utils.NUM_INPUT_PATHS, ml_utils.MAX_PATH_LENGTH, 1, continuous_count, categorical_count)
+latest = tf.train.latest_checkpoint('ml_files/' + model_name)
+print(latest)
 card_model.load_weights(latest)
 print('Looking up embeddings')
 STRIDE = 512
 embeddings = []
 for i in range(1, len(all_paths), STRIDE):
     cur_paths = tf.constant(our_paths[i:i + STRIDE])
-    cur_features = tf.constant(features[i:i + STRIDE])
-    card_embeddings = card_model([cur_paths, cur_features])
+    cur_continuous_features = tf.constant(continuous_features[i:i+STRIDE])
+    cur_categorical_features = tf.constant(categorical_features[i:i+STRIDE])
+    card_embeddings = card_model([cur_paths, cur_continuous_features, cur_categorical_features])
     embeddings.append(card_embeddings)
+    print(card_embeddings[0])
 card_embeddings = tf.concat(embeddings, 0)
 # _, max_cube_size = utils.build_cubes(folder, num_cubes,
 #                                      num_cards, card_to_int)
@@ -79,16 +84,17 @@ card_embeddings = tf.concat(embeddings, 0)
 
 
 idx = card_to_int[name]
+print(card_embeddings[idx])
 print('calculating similiarities')
 # dist_f = CosineSimilarity()
-dists = np.array([
-    tf.reshape(tf.keras.layers.dot([card_embeddings[idx], x], 1, normalize=True), ()).numpy() for x in card_embeddings
-])
-ranked = dists.argsort()[::-1]
+# dists = np.array([
+#     tf.reshape(tf.keras.layers.dot([card_embeddings[idx], x], 1, normalize=True), ()).numpy() for x in card_embeddings
+# ])
+# ranked = dists.argsort()[::-1]
 # card = tf.tile(tf.reshape(card_embeddings[idx], (1, 256)), [len(all_paths) - 1, 1])
 # dists = tf.norm(tf.subtract(card, card_embeddings), axis=1).numpy()
-# dists = np.array([tf.norm(tf.subtract(card_embeddings[idx], x)) for x in card_embeddings])
-# ranked = dists.argsort()
+dists = np.array([tf.norm(tf.subtract(card_embeddings[idx], x)) for x in card_embeddings])
+ranked = dists.argsort()
 
 for i in range(N):
     card_idx = ranked[i]

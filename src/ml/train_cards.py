@@ -1,7 +1,5 @@
 # enable sibling imports
 import json
-import os
-import random
 import sys
 from pathlib import Path
 
@@ -14,7 +12,7 @@ if __name__ == "__main__":
 
 from generator import CardDataGenerator
 from model import CardEncoderWrapper, CardEncoder
-from metrics import FilteredBinaryAccuracy, TripletAccuracy, TripletFilteredAccuracy, ContrastiveFilteredAccuracy
+from metrics import FilteredBinaryAccuracy, TripletFilteredAccuracy, ContrastiveFilteredAccuracy
 from losses import TripletLoss, ContrastiveLoss
 
 if __name__ == "__main__":
@@ -26,6 +24,7 @@ if __name__ == "__main__":
     walk_len = int(args[3])
     example_count = int(args[4])
     temperature = float(args[5])
+    margin = float(args[6])
 
     map_file = '././data/maps/nameToId.json'
     folder = "././data/cube/"
@@ -36,11 +35,6 @@ if __name__ == "__main__":
     int_to_card = {int(k): v for k, v in int_to_card.items()}  # if int(k) < 1000}
     card_to_int = {v: k for k, v in int_to_card.items()}
     num_cards = len(int_to_card)
-
-    print('Loading Adjacency Matrix . . .\n')
-
-    adj_mtx = np.load('././output/full_adj_mtx.npy')
-    card_counts = np.load('././output/card_counts.npy')
 
     print('Setting up Generator . . .\n')
     output_dir = f'././ml_files/{name}/'
@@ -62,31 +56,34 @@ if __name__ == "__main__":
                 del card['typeLine']
             if "otherParses" in card:
                 del card["otherParses"]
+
     generator = CardDataGenerator(
-        adj_mtx,
         walk_len,
-        card_counts,
         cards,
         batch_size=batch_size,
-        example_count=example_count
+        example_count=example_count,
+        data_path='./output',
     )
     print('Setting Up Model . . . \n')
     autoencoder = CardEncoder("card_encoder", generator.vocab_dict, generator.max_paths,
-                              generator.max_path_length, example_count + 1, generator.feature_count)
+                              generator.max_path_length, example_count + 1,
+                              generator.continuous_features_count,
+                              generator.categorical_features_count)
+    assert example_count == 2
     # autoencoder.compile(
     #     optimizer='adam',
-    #     loss=[TripletLoss()],
+    #     loss=[TripletLoss(margin)],
     #     loss_weights=[1.0],
-    #     metrics=[TripletAccuracy("triplet_accuracy"),
-    #              TripletFilteredAccuracy(True, "true_accuracy"),
-    #              TripletFilteredAccuracy(False, "false_accuracy")]
+    #     metrics=[TripletFilteredAccuracy(None, margin, "accuracy"),
+    #              TripletFilteredAccuracy(True, margin, "true_accuracy"),
+    #              TripletFilteredAccuracy(False, margin, "false_accuracy")]
     # )
     autoencoder.compile(
         optimizer='adam',
         loss=[ContrastiveLoss(example_count, temperature)],
-        metrics=[ContrastiveFilteredAccuracy(None, example_count, "accuracy"),
-                 ContrastiveFilteredAccuracy(True, example_count, "true_accuracy"),
-                 ContrastiveFilteredAccuracy(False, example_count, "false_accuracy")]
+        metrics=[ContrastiveFilteredAccuracy(None, example_count, margin, "accuracy"),
+                 ContrastiveFilteredAccuracy(True, example_count, margin, "true_accuracy"),
+                 ContrastiveFilteredAccuracy(False, example_count, margin, "false_accuracy")]
     )
     latest = tf.train.latest_checkpoint(output_dir)
     if latest is not None:
@@ -107,3 +104,5 @@ if __name__ == "__main__":
         epochs=epochs,
         callbacks=[cp_callback]  #, early_stop_callback]
     )
+    Path(f'{output_dir}/final').mkdir(parents=True, exist_ok=True)
+    autoencoder.save(f'{output_dir}/final', save_format='tf')

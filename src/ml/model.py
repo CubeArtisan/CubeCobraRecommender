@@ -25,10 +25,12 @@ Epochs: 100
 
 Batch Size: 64
 """
-CNN_SIZE = 16
+CNN_SIZE = 32
 CNN_WINDOW_SIZE = 4
 EMBED_SIZE = 64
-PATH_EMBED_SIZE = 256
+CATEGORICAL_EMBED_SIZE = 256
+CONTINUOUS_EMBED_SIZE = 64
+PATH_EMBED_SIZE = 512
 CARD_EMBED_SIZE = 256
 
 
@@ -36,47 +38,62 @@ class CardEncoder(Model):
     """
     Encode cards to vectors
     """
-    def __init__(self, name, vocab_dict, max_paths, max_path_length, width, feature_count):
+    def __init__(self, name, vocab_dict, max_paths, max_path_length, width,
+                 continuous_feature_count, categorical_feature_count):
         super().__init__()
         self.assigned_name = name
         self.max_paths = max_paths
         self.max_path_length = max_path_length
         self.width = width
-        self.feature_count = feature_count
+        self.continuous_feature_count = continuous_feature_count
+        self.categorical_feature_count = categorical_feature_count
         self.cnn = tf.keras.layers.Conv2D(CNN_SIZE, (CNN_WINDOW_SIZE, 300))
+        print(len(vocab_dict))
         embedding_tensor = [0 for _ in range(len(vocab_dict))]
         for index, embedding in vocab_dict.values():
             embedding_tensor[index] = embedding.astype(np.float32)
         embedding_tensor = tf.convert_to_tensor(embedding_tensor)
-        self.dropout = tf.keras.layers.Dropout(0.25, name='path_dropout')
+        self.continuous_dropout = tf.keras.layers.Dropout(0.5, name='continuous_dropout')
+        self.dropout = tf.keras.layers.Dropout(0.25, name='dropout')
         self.flatten = tf.keras.layers.Flatten()
         self.embedding_tensor = tf.Variable(embedding_tensor)
         self.embed_paths = Dense(PATH_EMBED_SIZE, activation="tanh")
-        self.embed_dense = Dense(CARD_EMBED_SIZE, activation="relu")
+        self.embed_dense = Dense(CARD_EMBED_SIZE, activation="tanh")
+        self.continuous_dense1 = Dense(CONTINUOUS_EMBED_SIZE*2, activation="tanh")
+        self.continuous_dense2 = Dense(CONTINUOUS_EMBED_SIZE, activation="tanh")
+        self.categorical_dense = Dense(CATEGORICAL_EMBED_SIZE, activation="tanh")
         self.attention_layer = AttentionLayer(name=self.assigned_name + "_attention")
         print('preprocessed cards')
 
     def call(self, x, training=None, mask=None):
-        paths, features = x
+        paths, continuous_features, categorical_features = x
         batch_size = tf.shape(paths)[0]
-        features_embed = tf.gather(self.embedding_tensor, features) # batch_size, width, feature_count, 300
-        features_embed = tf.reshape(features_embed, (batch_size, self.width, 300 * self.feature_count))
+        categorical_features_embed = tf.gather(self.embedding_tensor, categorical_features) # batch_size, width, feature_count, 300
+        categorical_features_flat = tf.reshape(categorical_features_embed,
+                                               (batch_size, self.width,
+                                                300 * self.categorical_feature_count))
+        categorical_features_dense = self.categorical_dense(categorical_features_flat)
+        continuous_features_flat = tf.reshape(continuous_features, (batch_size, self.width,
+                                                               self.continuous_feature_count))
+        continuous_features_embed1 = self.continuous_dense1(continuous_features_flat)
+        continuous_features_embed = self.continuous_dense2(continuous_features_embed1)
+        continuous_features_embed = self.continuous_dropout(continuous_features_embed, training=training)
         all_paths_embed = tf.gather(self.embedding_tensor, paths) # batch_size, width, max_paths, max_path_length, 300
         flat_paths_embed = tf.reshape(all_paths_embed, [batch_size * self.max_paths * self.width,
                                                         self.max_path_length, 300, 1])
         final_cnn_state = self.cnn(flat_paths_embed)
         flattened_cnn_state = self.flatten(final_cnn_state)
-        print(tf.shape(flattened_cnn_state))
-        flattened_dropout = self.dropout(flattened_cnn_state, training=training)
-        flattened_dense = self.embed_paths(flattened_dropout)
+        flattened_dense = self.embed_paths(flattened_cnn_state)
         by_card = tf.reshape(flattened_dense,
                              (batch_size * self.width, self.max_paths, PATH_EMBED_SIZE))
         code_vectors, attention_weights = self.attention_layer([by_card])
         code_vectors = tf.reshape(code_vectors, (batch_size, self.width, PATH_EMBED_SIZE))
-        with_features = tf.concat([code_vectors, features_embed], 2)
+        with_features = tf.concat([code_vectors, continuous_features_embed,
+                                   categorical_features_dense], 2)
+        with_features = self.dropout(with_features, training=training)
         embedded = self.embed_dense(with_features)
-        embedded_normalized = tf.math.l2_normalize(embedded, 2)
-        return embedded_normalized
+        embedded = tf.math.l2_normalize(embedded, 2)
+        return embedded
 
 
 class Encoder(Model):
