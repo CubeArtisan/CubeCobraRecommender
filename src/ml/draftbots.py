@@ -2,6 +2,9 @@ import tensorflow as tf
 
 PACK_SIZE = 15
 PACKS = 3
+MAX_PACK_SIZE = 32
+MAX_SEEN = 512
+MAX_PICKED = 128
 
 
 class DraftBot(tf.keras.models.Model):
@@ -14,7 +17,7 @@ class DraftBot(tf.keras.models.Model):
             [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
             [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
             [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-        ])
+        ], dtype=tf.float32)
         self.colors_weights = tf.Variable([
             [20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20, 20],
             [40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40],
@@ -30,7 +33,7 @@ class DraftBot(tf.keras.models.Model):
             [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],
             [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
         ], dtype=tf.float32)
-        self.external_synergy_weights = tf.Variable([
+        self.pick_synergy_weights = tf.Variable([
             [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3],
             [4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4],
             [5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
@@ -54,10 +57,19 @@ class DraftBot(tf.keras.models.Model):
 
     def call(self, inputs, training=None, mask=None):
         card, picked, seen, pick_num, pack_num, packs, pack_size = inputs
+        card = tf.cast(card, 'int32')
+        pack_num = tf.cast(pack_num, "float32")
+        pick_num = tf.cast(pick_num, "float32")
+        packs = tf.cast(packs, "float32")
+        pack_size = tf.cast(pack_size, "float32")
 
-        def get_weights(weights):
-            xCoordinate = tf.divide(pack_num, packs)
-            yCoordinate = tf.divide(pick_num, pack_size)
+        def get_weights(weights, batch_index1):
+            pn = tf.gather(pack_num, batch_index1)
+            px = tf.gather(packs, batch_index1)
+            pin = tf.gather(pick_num, batch_index1)
+            ps = tf.gather(pack_size, batch_index1)
+            xCoordinate = tf.divide(pn, px)
+            yCoordinate = tf.divide(pin, ps)
             xIndex = PACKS * xCoordinate
             yIndex = PACK_SIZE * yCoordinate
             floorXIndex = tf.floor(xIndex)
@@ -68,6 +80,10 @@ class DraftBot(tf.keras.models.Model):
             yIndexModOne = tf.subtract(yIndex, floorYIndex)
             InvXIndexModOne = 1 - xIndexModOne
             InvYIndexModOne = 1 - yIndexModOne
+            floorYIndex = tf.cast(floorYIndex, 'int32')
+            floorXIndex = tf.cast(floorXIndex, 'int32')
+            ceilXIndex = tf.cast(ceilXIndex, 'int32')
+            ceilYIndex = tf.cast(ceilYIndex, 'int32')
             XY = tf.multiply(xIndexModOne, yIndexModOne)
             Xy = tf.multiply(xIndexModOne, InvYIndexModOne)
             xY = tf.multiply(InvXIndexModOne, yIndexModOne)
@@ -84,32 +100,39 @@ class DraftBot(tf.keras.models.Model):
 
         # This is a wildly inaccurate approximation, but works for a first draft
         def get_casting_probability(lands, card_index):
-            lands_for_card = tf.gather(self.land_requirements, card_index)
-            total_devotion = tf.reduce_sum(lands_for_card)
-            probability = tf.constant(1)
-            total_lands = tf.constant(0)
-            for i in range(5):
-                on_color_lands = tf.gather(lands, i)
-                devotion = tf.gather(lands_for_card, i)
-                probability = probability * tf.gather_nd(self.prob_to_play, (devotion,
-                                                                             on_color_lands))
-                total_lands = total_lands + tf.cond(devotion > 0, lambda: on_color_lands,
-                                                    lambda: tf.constant(0))
-            return probability * tf.gather_nd(self.prob_to_play, (total_devotion, total_lands))
+            card_index = tf.cast(tf.squeeze(card_index), 'int32')
+
+            def inner():
+                lands_for_card = tf.reshape(tf.gather(self.land_requirements, card_index), (-1,))
+                total_devotion = tf.reduce_sum(lands_for_card)
+                probability = tf.constant(1, dtype=tf.float32)
+                total_lands = tf.constant(0)
+                for i in range(5):
+                    on_color_lands = tf.cast(tf.gather(lands, i), 'int32')
+                    devotion = tf.cast(tf.gather(lands_for_card, i), "int32")
+                    probability = probability * tf.gather_nd(self.prob_to_play, (devotion,
+                                                                                 on_color_lands))
+                    total_lands = total_lands + tf.cond(devotion > 0, lambda: on_color_lands,
+                                                        lambda: tf.constant(0))
+                return probability * tf.gather_nd(self.prob_to_play, (total_devotion, total_lands))
+            return tf.cond(tf.greater(card_index, 0), inner, lambda: tf.constant(0, dtype=tf.float32))
 
         def get_rating(lands, card_index):
+            card_index = tf.cast(tf.squeeze(card_index), 'int32')
             rating = tf.reshape(self.ratings(card_index), ())
-            return get_casting_probability(lands, tf.gather(self.land_requirements, card_index))\
-                * rating
+            return tf.cond(tf.greater(card_index, 0),
+                           lambda: get_casting_probability(lands, card_index) * tf.reshape(self.ratings(card_index), ()),
+                           lambda: tf.constant(0, dtype=tf.float32))
 
         def transform_similarity(similarity):
             similarity_multiplier = 1 / (1 - self.similarity_clip)
             scaled = similarity_multiplier\
-                * tf.minimum(tf.maximum(0, similarity - self.similarity_clip),
+                * tf.minimum(tf.maximum(tf.constant(0, dtype=tf.float32),
+                                        similarity - self.similarity_clip),
                              1 - self.similarity_clip)
-            transformed = -tf.math.log(1 - scaled) * 5
-            return tf.map_fn(lambda value: tf.cond(tf.math.is_inf(value), lambda: tf.constant(10),
-                                                   lambda: value), transformed)
+            transformed = tf.squeeze(-tf.math.log(1 - scaled) * 5)
+            return tf.cond(tf.math.is_inf(transformed), lambda: tf.constant(10, dtype=tf.float32),
+                           lambda: transformed)
 
         def rating_oracle(lands, batch_index1, batch_index2):
             card_index = tf.gather_nd(card, (batch_index1, batch_index2))
@@ -117,83 +140,111 @@ class DraftBot(tf.keras.models.Model):
 
         def pick_synergy_oracle(lands, batch_index1, batch_index2):
             card_index = tf.gather_nd(card, (batch_index1, batch_index2))
-            card_embedding = tf.gather(self.card_embeddings, card_index)
-            card_embedding = tf.tile(tf.expand_dims(card_embedding, axis=0), [self.num_cards, 1])
-            similarities = tf.reshape(tf.keras.layers.dot([card_embedding, self.card_embeddings],
-                                                          normalize=True), (-1,))
-            synergies = transform_similarity(similarities)
-            probabilities = tf.map_fn(lambda ci: tf.cond(tf.equal(ci, card_index), lambda: 0,
-                                                         lambda: get_casting_probability(lands, ci)),
-                                      tf.range(self.num_cards))
-            weighted_synergies = tf.multiply(synergies, probabilities)
-            our_picked = tf.gather(picked, (batch_index1, batch_index2))
-            return tf.keras.layers.dot([weighted_synergies, our_picked])
+
+            def inner():
+                card_embedding = tf.expand_dims(tf.gather(self.card_embeddings, card_index), 0)
+                card_probability = get_casting_probability(lands, card_index)
+
+                def get_card_pick_synergy(other_index):
+                    other_index = tf.cast(other_index, 'int32')
+                    other_real_index = tf.gather_nd(picked, (batch_index1, other_index))
+
+                    def inner2():
+                        other_embedding = tf.expand_dims(tf.gather(self.card_embeddings, other_real_index), 0)
+                        similarity = tf.reshape(tf.keras.layers.dot([card_embedding, other_embedding],
+                                                                    normalize=True, axes=1), ())
+                        synergy = transform_similarity(similarity)
+                        other_probability = get_casting_probability(lands, other_real_index)
+                        return tf.cond(tf.greater(other_probability, self.prob_to_include),
+                                       lambda: synergy * other_probability,
+                                       lambda: tf.constant(0, dtype=tf.float32))
+                    return tf.cond(tf.greater(other_index, 0), inner2, lambda: tf.constant(0, dtype=tf.float32))
+                return card_probability * tf.reduce_sum(tf.map_fn(get_card_pick_synergy,
+                                                                  tf.range(MAX_PICKED, dtype=tf.float32),
+                                                                  parallel_iterations=MAX_PICKED))
+            return tf.cond(tf.greater(card_index, 0), inner, lambda: tf.constant(0, dtype=tf.float32))
 
         def fixing_oracle(lands, batch_index1, batch_index2):
             card_index = tf.gather_nd(card, (batch_index1, batch_index2))
 
             def calculate_fixing():
-                combination = tf.cast(tf.greater(lands, 3), "float32")
-                colors = tf.gather(self.card_colors, card_index)
-                overlap = 2 * tf.keras.layers.dot(combination, colors)
-                overlap = tf.cond(tf.gather(self.is_fetch, card_index), lambda: overlap,
+                combination = tf.expand_dims(tf.cast(tf.greater(lands, 2), "float32"), 0)
+                colors = tf.expand_dims(tf.cast(tf.gather(self.card_colors, card_index), 'float32'), 0)
+                overlap = 2.0 * tf.reshape(tf.keras.layers.dot([combination, colors], axes=1), ())
+                return tf.cond(tf.gather(self.is_fetch, card_index), lambda: overlap,
                                   lambda: tf.cond(tf.gather(self.has_basic_land_types, card_index),
                                                   lambda: 0.75 * overlap,
                                                   lambda: 0.5 * overlap))
-            return tf.cond(tf.gather(self.is_land, card_index), calculate_fixing,
-                           lambda: tf.constant(0))
+                return overlap
+            return tf.cond(tf.logical_and(tf.gather(self.is_land, card_index), tf.greater(card_index, 0)),
+                           calculate_fixing,
+                           lambda: tf.constant(0, dtype=tf.float32))
 
         def internal_synergy_oracle(lands, batch_index1, batch_index2):
+            def card_probability(card_index):
+                card_index = tf.cast(card_index, 'int32')
+                card_real_index = tf.gather_nd(picked, (batch_index1, card_index))
+                return tf.cond(tf.greater(card_real_index, 0), lambda: get_casting_probability(lands, card_real_index),
+                               lambda: tf.constant(0, dtype=tf.float32))
+            probabilities = tf.map_fn(card_probability, tf.range(MAX_PICKED, dtype=tf.float32),
+                                      parallel_iterations=MAX_PICKED)
+
             def get_card_internal_synergy(card_index):
-                card_probability = get_casting_probability(lands, card_index)
+                card_index = tf.cast(card_index, 'int32')
+                card_real_index = tf.gather_nd(picked, (batch_index1, card_index))
+                card_probability = tf.gather(probabilities, card_index)
 
                 def inner():
+                    card_embedding = tf.expand_dims(tf.gather(self.card_embeddings, card_real_index), 0)
+
                     def synergy_with_card(other_index):
-                        card_embedding = tf.gather(self.card_embeddings, card_index)
-                        other_probability = get_casting_probability(lands, other_index)
-                        other_count = tf.gather_nd(picked, (batch_index1, batch_index2, other_index))
-                        other_count = tf.cond(tf.equal(other_index, card_index),
-                                              lambda: other_count - 1,
-                                              lambda: other_count)
+                        other_index = tf.cast(other_index, 'int32')
+                        other_real_index = tf.gather_nd(picked, (batch_index1, other_index))
+                        other_probability = tf.gather(probabilities, other_index)
 
                         def inner2():
-                            other_embedding = tf.gather(self.other_embedding, other_index)
+                            other_embedding = tf.expand_dims(tf.gather(self.card_embeddings, other_real_index), 0)
                             similarity = tf.keras.layers.dot([card_embedding, other_embedding],
-                                                             nomralize=True)
+                                                             normalize=True, axes=1)
                             synergy = transform_similarity(similarity)
-                            return other_count * synergy * other_probability * card_probability
-                        return tf.cond(tf.logical_and(tf.greater(other_count, 0),
-                                                      tf.greater_equal(other_probability,
-                                                                       self.prob_to_include)),
-                                       inner2, lambda: 0)
-                    return tf.reduce_sum(tf.map_fn(synergy_with_card, tf.range(self.num_cards)))
-                seen_count = tf.gather_nd(picked, (batch_index1, batch_index2, card_index))
-                tf.cond(tf.logical_and(tf.greater(seen_count, 0),
-                                       tf.greater_equal(card_probability, self.prob_to_include)),
-                                       inner, lambda: 0)
-            return tf.reduce_sum(tf.map_fn(get_card_internal_synergy, tf.range(self.num_cards)))
+                            return tf.squeeze(synergy * other_probability)
+                        return tf.cond(tf.logical_and(tf.greater_equal(other_probability,
+                                                                       self.prob_to_include),
+                                                      tf.greater(other_real_index, 0)),
+                                       inner2, lambda: tf.constant(0, dtype=tf.float32))
+                    return card_probability * tf.reduce_sum(tf.map_fn(synergy_with_card,
+                                                                      tf.range(MAX_PICKED, dtype=tf.float32),
+                                                                      parallel_iterations=16))
+                return tf.cond(tf.logical_and(tf.greater(card_real_index, 0),
+                                              tf.greater_equal(card_probability, self.prob_to_include)),
+                               inner, lambda: tf.constant(0, dtype=tf.float32))
+            synergy_scores = tf.map_fn(get_card_internal_synergy, tf.range(MAX_PICKED, dtype=tf.float32),
+                                       parallel_iterations=16)
+            return tf.reduce_sum(synergy_scores)
 
         def openness_oracle(lands, batch_index1, batch_index2):
             def get_card_openness(card_index):
-                card_probability = get_casting_probability(lands, card_index)
-                card_count = tf.gather_nd(seen, (batch_index1, batch_index2, card_index))
-                return tf.cond(tf.logical_and(tf.greater(card_count, 0),
+                card_index = tf.cast(card_index, 'int32')
+                card_real_index = tf.gather_nd(seen, (batch_index1, card_index))
+                card_probability = get_casting_probability(lands, card_real_index)
+                return tf.cond(tf.logical_and(tf.greater(card_real_index, 0),
                                               tf.greater_equal(card_probability,
                                                                self.prob_to_include)),
-                               lambda: card_count * get_rating(lands, card_index),
-                               lambda: 0)
-            return tf.reduce_sum(tf.map_fn(get_card_openness, tf.range(self.num_cards)))
+                               lambda: get_rating(lands, card_real_index),
+                               lambda: tf.constant(0, dtype=tf.float32))
+            return tf.reduce_sum(tf.map_fn(get_card_openness, tf.range(MAX_SEEN, dtype=tf.float32)))
 
         def color_oracle(lands, batch_index1, batch_index2):
             def get_card_contribution(card_index):
-                card_probability = get_casting_probability(lands, card_index)
-                card_count = tf.gather_nd(picked, (batch_index1, batch_index2, card_index))
-                return tf.cond(tf.logical_and(tf.greater(card_count, 0),
+                card_index = tf.cast(card_index, 'int32')
+                card_real_index = tf.gather_nd(picked, (batch_index1, card_index))
+                card_probability = get_casting_probability(lands, card_real_index)
+                return tf.cond(tf.logical_and(tf.greater(card_index, 0),
                                               tf.greater_equal(card_probability,
                                                                self.prob_to_include)),
-                               lambda: card_count * get_rating(lands, card_index),
-                               lambda: 0)
-            return tf.reduce_sum(tf.map_fn(get_card_contribution, tf.range(self.num_cards)))
+                               lambda: get_rating(lands, card_real_index),
+                               lambda: tf.constant(0, dtype=tf.float32))
+            return tf.reduce_sum(tf.map_fn(get_card_contribution, tf.range(MAX_PICKED, dtype=tf.float32)))
 
         oracles = [rating_oracle, pick_synergy_oracle, fixing_oracle, internal_synergy_oracle,
                    openness_oracle, color_oracle]
@@ -201,10 +252,25 @@ class DraftBot(tf.keras.models.Model):
                    self.internal_synergy_weights, self.openness_weights, self.colors_weights]
 
         def get_score(lands, batch_index1, batch_index2):
-            return tf.reduce_sum([oracle(lands, batch_index1, batch_index2) * get_weights(weight)
-                                  for oracle, weight in zip(oracles, weights)])
+            score = tf.squeeze(tf.cast(rating_oracle(lands, batch_index1, batch_index2), 'float32'))\
+                * tf.squeeze(tf.cast(get_weights(self.rating_weights, batch_index1), 'float32'))
+            score = score + tf.squeeze(tf.cast(pick_synergy_oracle(lands, batch_index1, batch_index2), 'float32'))\
+                * tf.squeeze(tf.cast(get_weights(self.pick_synergy_weights, batch_index1), 'float32'))
+            score = score + tf.squeeze(tf.cast(fixing_oracle(lands, batch_index1, batch_index2), 'float32'))\
+                * tf.squeeze(tf.cast(get_weights(self.fixing_weights, batch_index1), 'float32'))
+            score = score + tf.squeeze(tf.cast(internal_synergy_oracle(lands, batch_index1, batch_index2), 'float32'))\
+                * tf.squeeze(tf.cast(get_weights(self.internal_synergy_weights, batch_index1), 'float32'))
+            score = score + tf.squeeze(tf.cast(openness_oracle(lands, batch_index1, batch_index2), 'float32'))\
+                * tf.squeeze(tf.cast(get_weights(self.openness_weights, batch_index1), 'float32'))
+            score = score + tf.squeeze(tf.cast(color_oracle(lands, batch_index1, batch_index2), 'float32'))\
+                * tf.squeeze(tf.cast(get_weights(self.colors_weights, batch_index1), 'float32'))
+            return score
 
         def do_climb(batch_index1, batch_index2):
+            batch_index1 = tf.cast(batch_index1, 'int32')
+            batch_index2 = tf.cast(batch_index2, 'int32')
+            card_index = tf.gather_nd(card, (batch_index1, batch_index2))
+
             def climb_cond(prev_value, current_value, _):
                 return tf.greater(current_value, prev_value)
 
@@ -219,21 +285,28 @@ class DraftBot(tf.keras.models.Model):
                                                                 lambda: tf.gather(lands, i) - 1,
                                                                 lambda: tf.cond(tf.equal(add_index, i),
                                                                                 lambda: tf.gather(lands, i) + 1,
-                                                                                lambda: tf.gather(lands, i))))
+                                                                                lambda: tf.gather(lands, i))),
+                                              tf.range(5))
                         new_value = tf.cond(tf.greater(tf.gather(lands, remove_index), 0),
                                             lambda: get_score(new_lands, batch_index1, batch_index2),
-                                            lambda: 0)
+                                            lambda: tf.constant(0, dtype=tf.float32))
                         final_lands = tf.cond(tf.greater(new_value, final_value), lambda: new_lands,
                                               lambda: final_lands)
-                        final_value = tf.maximum(new_value, final_value)
+                print(current_value, final_value, final_lands)
                 return current_value, final_value, final_lands
 
-            _, score, _ = tf.while_loop(climb_cond, try_climb, [tf.constant(0), tf.constant(1),
-                                                                    tf.constant([4, 4, 3, 3, 3])])
-            return score
+            def do_while_loop():
+                _, score, _ = tf.while_loop(climb_cond, try_climb, [tf.constant(-1, dtype=tf.float32),
+                                                                    tf.constant(0, dtype=tf.float32),
+                                                                    tf.constant([4, 4, 3, 3, 3])],
+                                            parallel_iterations=1)
+                return score
+            return tf.cond(tf.greater(card_index, 0), do_while_loop, lambda: tf.constant(0, dtype=tf.float32))
 
         batch_size = tf.shape(card)[0]
-        pack_size = tf.shape(card)[1]
-        return tf.map_fn(lambda b1: tf.nn.softmax(tf.map_fn(lambda b2: do_climb(b1, b2),
-                                                            tf.range(pack_size))),
-                         tf.range(batch_size))
+        pack_count = tf.shape(card)[1]
+        return tf.map_fn(lambda b1: tf.map_fn(lambda b2: do_climb(b1, b2),
+                                              tf.range(pack_count, dtype=tf.float32),
+                                              parallel_iterations=MAX_PACK_SIZE),
+                         tf.range(batch_size, dtype=tf.float32),
+                         parallel_iterations=16)

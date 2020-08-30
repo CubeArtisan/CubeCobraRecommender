@@ -8,6 +8,7 @@ from tensorflow.keras.utils import Sequence
 from tensorflow.keras.preprocessing.sequence import skipgrams
 
 from ml.ml_utils import generate_paths, MAX_PATH_LENGTH, NUM_INPUT_PATHS
+from ml.draftbots import MAX_PACK_SIZE, MAX_SEEN, MAX_PICKED
 
 WINDOW_SIZE = 4
 NUM_EXAMPLES = 2**15
@@ -289,3 +290,66 @@ class CardDataGenerator(Sequence):
             .reshape((self.batch_size, self.example_count + 1, self.continuous_features_count, 1))
         y_s = np.zeros_like(categorical_features)
         return [paths, continuous_features, categorical_features], y_s
+
+
+def to_one_hot(items, num_items):
+    result = np.zeros((num_items,))
+    for item in items:
+        result[item] = 1
+    return result
+
+
+def convert_picks_to_data(num_cards, picks, card_to_int):
+    data = []
+    for pick in picks:
+        # cards = [card_to_int(c) for c in pick['cards']]
+        cards = pick['cards']
+        cards = cards + [0 for _ in range(len(cards), MAX_PACK_SIZE)]
+        picked = pick['picked'] + [0 for _ in range(len(pick['picked']), MAX_PICKED)]
+        seen = pick['seen'] + [0 for _ in range(len(pick['seen']), MAX_SEEN)]
+        pick_num = pick['pickNum']
+        pack_num = pick['packNum']
+        packs = pick['packs']
+        pack_size = pick['packSize']
+        users_choice = to_one_hot([pick['pickedIndex']], MAX_PACK_SIZE)
+        data.append((cards, picked, seen, pick_num, pack_num, packs, pack_size, users_choice))
+    return data
+
+
+class DraftBotGenerator(Sequence):
+    def __init__(self, batch_size, num_cards, picks, card_to_int, data_path):
+        super(DraftBotGenerator, self).__init__()
+        self.batch_size = batch_size
+        self.data = convert_picks_to_data(num_cards, picks, card_to_int)
+
+    def __len__(self):
+        np.random.shuffle(self.data)
+        return len(self.data) // self.batch_size
+
+    def __getitem__(self, item):
+        cards = []
+        picked = []
+        seen = []
+        pick_num = []
+        pack_num = []
+        packs = []
+        pack_size = []
+        expected = []
+        for cs, p, s, pin, pan, pa, ps, uc in self.data[item * self.batch_size:(item + 1) * self.batch_size]:
+            cards.append(cs)
+            picked.append(p)
+            seen.append(s)
+            pick_num.append(pin)
+            pack_num.append(pan)
+            packs.append(pa)
+            pack_size.append(ps)
+            expected.append(uc)
+        cards = np.array(cards)
+        picked = np.array(picked)
+        seen = np.array(seen)
+        pick_num = np.array(pick_num)
+        pack_num = np.array(pack_num)
+        packs = np.array(packs)
+        pack_size = np.array(pack_size)
+        expected = np.array(expected)
+        return [cards, picked, seen, pick_num, pack_num, packs, pack_size], expected
