@@ -21,6 +21,7 @@ if __name__ == "__main__":
     epochs = int(args[0])
     batch_size = int(args[1])
     name = args[2]
+    temperature = float(args[3])
 
     map_file = '././data/maps/nameToId.json'
     folder = "././data/cube/"
@@ -75,8 +76,8 @@ if __name__ == "__main__":
     has_basic_land_types = is_land
     tf.compat.v1.disable_eager_execution()
     autoencoder = DraftBot(num_cards, embs, prob_to_play, land_requirements, card_colors, is_land,
-                           is_fetch, has_basic_land_types)
-    autoencoder.compile(optimizer='adam', loss=['binary_cross_entropy'])
+                           is_fetch, has_basic_land_types, temperature)
+    autoencoder.compile(optimizer='adam', loss=['categorical_crossentropy'])
     latest = tf.train.latest_checkpoint(output_dir)
     if latest is not None:
         autoencoder.load_weights(latest)
