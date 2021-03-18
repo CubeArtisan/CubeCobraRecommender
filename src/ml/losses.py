@@ -1,5 +1,12 @@
 import tensorflow as tf
 
+# class CustomCrossEntropy(tf.keras.losses.Loss):
+#     def __init__(self, **kwargs):
+#         super(CustomCrossEntropy, self).__init__(**kwargs)
+
+#     def call(self, y_true, y_pred):
+#         y_pred = tf.convert_to_tensor(y_pred)
+
 
 class TripletLoss(tf.keras.losses.Loss):
     def __init__(self, margin, **kwargs):
