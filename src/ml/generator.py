@@ -298,18 +298,17 @@ def to_one_hot(item, num_items):
 
 
 class DraftBotGenerator(Sequence):
-    def __init__(self, batch_size, in_pack_card_indices, in_pack_counts, seen_indices, seen_counts,
+    def __init__(self, batch_size, in_pack_card_indices, seen_indices, seen_counts,
                  picked_card_indices, picked_counts, pack_0s, pack_1s, pick_0s, pick_1s, frac_packs,
-                 frac_picks, internal_synergy_matrices, picked_synergy_matrices, prob_seen_matrices,
+                 frac_picks,
+                 # internal_synergy_matrices, picked_synergy_matrices,
+                 prob_seen_matrices,
                  prob_picked_matrices, prob_in_pack_matrices, chosen_cards):
         super(DraftBotGenerator, self).__init__()
         print(len(chosen_cards))
         self.batch_size = batch_size
         self.data = np.arange(len(chosen_cards))
-        # for i, chosen in enumerate(chosen_cards):
-        #     in_pack_card_indices[0]
         self.in_pack_card_indices = np.int32(in_pack_card_indices)
-        self.in_pack_counts = np.int32(in_pack_counts)
         self.seen_indices = np.int32(seen_indices)
         self.seen_counts = np.float32(seen_counts)
         self.picked_card_indices = np.int32(picked_card_indices)
@@ -326,14 +325,15 @@ class DraftBotGenerator(Sequence):
             frac_pack * (1 - frac_pick),
             frac_pack * frac_pick,
         ] for frac_pack, frac_pick in zip(frac_packs, frac_picks)])
-        self.internal_synergy_matrices = np.float32(internal_synergy_matrices)
-        self.picked_synergy_matrices = np.float32(picked_synergy_matrices)
+        # self.internal_synergy_matrices = np.float32(internal_synergy_matrices)
+        # self.picked_synergy_matrices = np.float32(picked_synergy_matrices)
         self.prob_seen_matrices = np.uint8(prob_seen_matrices)
         self.prob_picked_matrices = np.uint8(prob_picked_matrices)
         self.prob_in_pack_matrices = np.uint8(prob_in_pack_matrices)
-        self.inputs = [self.in_pack_card_indices, self.in_pack_counts, self.seen_indices,
+        self.inputs = [self.in_pack_card_indices, self.seen_indices,
                        self.seen_counts, self.picked_card_indices, self.picked_counts, self.coords,
-                       self.coord_weights, self.internal_synergy_matrices, self.picked_synergy_matrices,
+                       self.coord_weights,
+                       # self.internal_synergy_matrices, self.picked_synergy_matrices,
                        self.prob_seen_matrices, self.prob_picked_matrices, self.prob_in_pack_matrices]
         self.chosen_cards = np.float32([to_one_hot(chosen_card, 16) for chosen_card in chosen_cards])
 
