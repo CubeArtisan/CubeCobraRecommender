@@ -64,8 +64,10 @@ class DraftBot(tf.keras.models.Model):
             # tf.math.log_sigmoid(tf.minimum(card_ratings, 8) / 10),
             dtype=tf.float32
         )
-        self.card_synergies = tf.Variable(tf.fill((len(card_ratings), len(card_ratings)), 0.0),
+        self.card_synergies = tf.Variable(tf.fill((len(card_ratings) * (len(card_ratings) + 1) // 2,), 0.0),
                                           dtype=tf.float32)
+        # [[0,0], [1, 0], [1, 1], [2, 0]
+        # x * (x + 1) / 2 + y
         self.temperature = tf.constant(temperature, dtype=tf.float32)
 
     def call(self, inputs, training=None, mask=None):
@@ -80,19 +82,19 @@ class DraftBot(tf.keras.models.Model):
         seen_ratings = tf.reshape(tf.gather(ratings, seen_indices, name='seen_ratings'), (-1, 360))
         picked_ratings = tf.reshape(tf.gather(ratings, picked_card_indices, name='picked_ratings'), (-1, 48))
 
-        picked_pairs_a = tf.reshape(picked_card_indices, (-1, 48, 1, 1))
-        picked_pairs_b = tf.reshape(picked_card_indices, (-1, 1, 48, 1))
-        internal_pairs = tf.concat([picked_pairs_a + tf.zeros_like(picked_pairs_b),
-                                    picked_pairs_b + tf.zeros_like(picked_pairs_a)],
-                                   axis=3)
-        internal_synergy_matrices = tf.gather_nd(self.card_synergies, internal_pairs)
+        picked_pairs_a = tf.reshape(picked_card_indices, (-1, 48, 1))
+        picked_pairs_b = tf.reshape(picked_card_indices, (-1, 1, 48))
+        internal_pairs_idx1 = picked_pairs_a * (picked_pairs_a + 1) + picked_pairs_b
+        internal_pairs_idx2 = picked_pairs_b * (picked_pairs_b + 1) + picked_pairs_a
+        internal_pairs = tf.maximum(internal_pairs_idx1, internal_pairs_idx2)
+        internal_synergy_matrices = tf.gather(self.card_synergies, internal_pairs)
         print('internal_synergy_matrices', internal_synergy_matrices.shape)
 
-        in_pack_pairs_a = tf.reshape(in_pack_card_indices, (-1, 16, 1, 1))
-        picked_pairs = tf.concat([picked_pairs_b + tf.zeros_like(in_pack_pairs_a),
-                                  in_pack_pairs_a + tf.zeros_like(picked_pairs_b)],
-                                 axis=3)
-        picked_synergy_matrices = tf.gather_nd(self.card_synergies, picked_pairs)
+        in_pack_pairs = tf.reshape(in_pack_card_indices, (-1, 16, 1))
+        picked_pairs_idx1 = in_pack_pairs * (in_pack_pairs + 1) + picked_pairs_b
+        picked_pairs_idx2 = picked_pairs_b * (picked_pairs_b + 1) + in_pack_pairs
+        picked_pairs = tf.maximum(picked_pairs_idx1, picked_pairs_idx2)
+        picked_synergy_matrices = tf.gather(self.card_synergies, picked_pairs)
 
         rating_weights = tf.reshape(tf.reduce_sum(tf.gather_nd(
             # 10 * tf.sigmoid(self.rating_weights), coords) * coord_weights, 1), (-1, 1))
