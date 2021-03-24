@@ -4,7 +4,6 @@ from itertools import chain
 from typing import Dict, List, Tuple, Union
 
 import numpy as np
-import spacy
 
 MAX_PATH_LENGTH = 32
 NUM_INPUT_PATHS = 64
@@ -115,6 +114,7 @@ def convert_structure(structure: Union[list, dict, int, str, bool],
 
 
 def generate_card_structures(cards):
+    import spacy
     print('Converting cards to trees.')
     nlp = spacy.load('en_core_web_lg')
     vocab_dict = {"<unkown>": (0, np.zeros((300,)))}
