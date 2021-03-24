@@ -8,6 +8,7 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
+import tensorflow as tf
 
 MAX_IN_PACK = 16
 MAX_SEEN = 360
@@ -25,6 +26,12 @@ FEATURES = (
     (np.uint8, (NUM_LAND_COMBS, MAX_PICKED), 'prob_pickeds'),
     (np.uint8, (NUM_LAND_COMBS, MAX_IN_PACK), 'prob_in_packs'),
 )
+COMPRESSION = 'GZIP'
+PICK_SIGNATURE = (tuple(tf.TensorSpec(shape=shape, dtype=dtype) for dtype, shape, _ in FEATURES),
+                  tf.TensorSpec(shape=(MAX_IN_PACK,)))
+NUM_TRAIN_PICKS = 4096000
+NUM_TRAIN_SHARDS = 256
+NUM_TEST_SHARDS = 32
 FETCH_LANDS = {
     "arid mesa": ['r', 'w'],
     "bad river": ['u', 'b'],
@@ -276,8 +283,10 @@ def to_one_hot(item, num_items):
 
 
 def load_pick(pick, costs_list, card_devotions, card_colors, prob_table, num_land_combs=16, num_land_tries=50):
+    chosen_card = [1 if c == pick['chosenCard'] else 0 for c in in_pack]
     if (not (2 <= len(pick['cardsInPack']) <= 16 and 1 <= len(pick['seen']) <= 360 and 2 <= len(pick['picked']) <= 48))\
-            or None in pick['seen'] or None in pick['picked'] or None in pick['cardsInPack']:
+            or None in pick['seen'] or None in pick['picked'] or None in pick['cardsInPack']\
+            or all(x == 0 for x in chosen_card):
         return None
     seen, picked, in_pack = [[c + 1 for c in pick[k]] for k in ('seen', 'picked', 'cardsInPack')]
     in_pack = in_pack + [0 for _ in range(16 - len(in_pack))]
@@ -291,11 +300,14 @@ def load_pick(pick, costs_list, card_devotions, card_colors, prob_table, num_lan
     coord_weights = ((1 - pack_frac) * (1 - pick_frac), (1 - pack_frac) * pick_frac, pack_frac * (1 - pick_frac), pack_frac * pick_frac)
     prob_seen, prob_picked, prob_in_pack = generate_probs(picked, seen, in_pack, costs_list, card_devotions,
                                                           card_colors, prob_table, num_land_combs, num_land_tries)
-    return (in_pack, seen, seen_count, picked, picked_count, coords, coord_weights, prob_seen,
-            prob_picked, prob_in_pack)
+    pick_data = [feature[0](value) for feature, value in zip(FEATURES, (in_pack, seen, seen_count,
+                                                                        picked, picked_count, coords,
+                                                                        coord_weights, prob_seen,
+                                                                        prob_picked, prob_in_pack))]
+    return (pick_data, chosen_card)
 
 
-def parse_picks(pick_file_name, costs_list, card_devotions, card_colors, prob_table, num_land_combs=16, num_land_tries=50):
+def parse_picks(pick_file_name, pool, costs_list, card_devotions, card_colors, prob_table, num_land_combs=16, num_land_tries=50):
     logger.info(f'Started parsing {pick_file_name}')
     parsed_data = []
     draftNum = 0
@@ -304,9 +316,9 @@ def parse_picks(pick_file_name, costs_list, card_devotions, card_colors, prob_ta
         pick_file_json = json.load(pick_file)
     for draft_entry in pick_file_json:
         for pick in draft_entry["picks"]:
-            loaded_data = load_pick(pick, costs_list, card_devotions, card_colors, prob_table, num_land_combs, num_land_tries)
+            loaded_data = pool.apply(load_pick, (pick, costs_list, card_devotions, card_colors, prob_table, num_land_combs, num_land_tries))
             if loaded_data is not None:
-                parsed_data.append(loaded_data)
+                yield loaded_data
         draftNum += 1
         logger.debug(f'Completed draft {draftNum} and pick {len(parsed_data)}')
     logger.info(f'Parsed {pick_file_name} which had {len(parsed_data)} usable picks.')
@@ -314,33 +326,51 @@ def parse_picks(pick_file_name, costs_list, card_devotions, card_colors, prob_ta
     return [feature[0](parsed) for feature, parsed in zip(FEATURES, zip(*parsed_data))]
 
 
-def parse_all_picks(pick_cache_dir, num_land_combs=16, num_land_tries=50, num_workers=None):
+def picks_dataset(num_land_combs, num_land_tries, num_workers=None):
     card_devotions, card_colors, costs_list = load_card_data()
     prob_table = load_prob_table()
-    parsed_data = []
-    shared_params = (costs_list, card_devotions, card_colors, prob_table, num_land_combs, num_land_tries)
-    with multiprocessing.Pool(num_workers) as proc_pool:
-        parsed_data = proc_pool.starmap(parse_picks, [(f'data/drafts/{i}.json', *shared_params)
-                                                      for i in range(len(glob.glob('data/drafts/*.json')))][1308:],
-                                        1)
-    parsed_data = [np.concatenate(feature) for feature in zip(*parsed_data)]
-    pick_cache_dir.mkdir(exist_ok=True, parents=True)
-    for feature, parsed in zip(FEATURES, parsed_data):
-        path = pick_cache_dir / f'{feature[2]}.bin'
-        path.touch()
-        num_rows = path.stat().st_size // np.dtype(feature[0]).itemsize // int(np.prod(feature[1]))
-        saved = np.memmap(path, mode='r+', dtype=feature[0], shape=(num_rows + parsed.shape[0], *feature[1]))
-        saved[num_rows:] = parsed
-        saved.flush()
+    proc_pool = multiprocess.Pool(num_workers)
+    shared_params = (proc_pool, costs_list, card_devotions, card_colors, prob_table, num_land_combs, num_land_tries)
+    return tf.data.Dataset.from_files('data/drafts/*.json').interleave(
+        lambda filename: tf.data.Dataset.from_generator(lambda: parse_picks(filename, *shared_params),
+                                                        output_signature=PICK_SIGNATURE),
+        num_parallel_calls=tf.data.AUTOTUNE
+    ).shuffle(2**15).enumerate().prefetch(tf.data.AUTOTUNE)
+
+def load_picks(cache_dir, batch_size):
+    return tf.data.experimental.load(
+        str(cache_dir),
+        (tf.TensorSpec(shape=(), dtype=tf.int64), PICK_SIGNATURE),
+        compression=COMPRESSION,
+        reader_func=lambda ds: ds.shuffle(NUM_TRAIN_SHARDS).interleave(lambda x: x, num_parallel_calls=tf.data.AUTOTUNE)
+    ).map(lambda _, y: y).shuffle(32 * batch_size).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 
 if __name__ == '__main__':
-    num_land_combs = NUM_LAND_COMBS
-    num_land_tries = int(sys.argv[1])
-    num_workers = int(sys.argv[2])
     formatter = logging.Formatter('[%(levelname)s/%(processName)s] %(message)s')
     handler = logging.StreamHandler()
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
+
+    num_land_tries = int(sys.argv[1])
+    num_workers = int(sys.argv[2])
+
+    pick_cache_dir = Path('data/parsed_picks/')
+    main_dataset = picks_dataset(NUM_LAND_COMBS, num_land_tries, num_workers)
+
+    train_cache_dir = pick_cache_dir / 'train'
+    train_cache_dir.mkdir(exist_ok=True)
+    train_dataset = main_dataset.take(NUM_TRAIN_PICKS).enumerate()
+    tf.data.experimental.save(train_dataset, str(train_cache_dir),
+                              compression=COMPRESSION,
+                              shard_func=lambda x, _: x % NUM_TRAIN_SHARDS)
+
+    test_cache_dir = pick_cache_dir / 'test'
+    test_cache_dir.mkdir(exist_ok=True)
+    test_dataset = main_dataset.skip(NUM_TRAIN_PICKS).enumerate()
+    tf.data.experimental.save(test_dataset, str(test_cache_dir),
+                              compression=COMPRESSION,
+                              shard_func=lambda x, _: x % NUM_TEST_SHARDS)
+
     parse_all_picks(Path('data/parsed_picks/'), num_land_combs, num_land_tries, num_workers)

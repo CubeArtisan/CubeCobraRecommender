@@ -316,6 +316,12 @@ class DraftBotGenerator(Sequence):
         #     inputs[i] = inputs[i][:,:16,:]
         return inputs, self.target[indices]
 
-    def __call__(self):
-        for i in range(len(self)):
-            yield self[i]
+    def __call__(self, *, start=0, end=None, shuffle=True):
+        if end == None:
+            end = self.num_picks
+        if shuffle:
+            idxs = self.data
+        else:
+            idxs = tuple(range(self.num_picks))
+        for i in idxs[start:end]:
+            yield (tuple(input_data[i] for input_data in self.inputs), self.target[i])
