@@ -312,8 +312,6 @@ class DraftBotGenerator(Sequence):
     def __getitem__(self, item):
         indices = self.data[item * self.batch_size:(item + 1) * self.batch_size]
         inputs = tuple(input_data[indices] for input_data in self.inputs)
-        # for i in range(7, 10):
-        #     inputs[i] = inputs[i][:,:16,:]
         return inputs, self.target[indices]
 
     def __call__(self, *, start=0, end=None, shuffle=True):

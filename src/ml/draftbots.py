@@ -2,163 +2,153 @@ import numpy as np
 import tensorflow as tf
 
 from ..non_ml.parse_picks import MAX_IN_PACK, MAX_PICKED, MAX_SEEN, NUM_LAND_COMBS
-
-EMBEDS_DIM = 64
-
-def calculate_synergies(name):
-    @tf.function(experimental_compile=True)
-    def inner(embeds_a, embeds_b, indices_a, indices_b):
-        print(embeds_a.shape)
-        norm_a = tf.sqrt(tf.reduce_sum(embeds_a * embeds_a, 2) + 1e-05)
-        norm_b = tf.sqrt(tf.reduce_sum(embeds_b * embeds_b, 2) + 1e-05)
-        expand_a = tf.expand_dims(embeds_a / tf.expand_dims(norm_a, 2), 2)
-        print(expand_a.shape)
-        expand_b = tf.expand_dims(embeds_b / tf.expand_dims(norm_b, 2), 1)
-        return tf.reduce_sum(expand_a * expand_b, -1)
-        # return tf.where(
-        #     tf.math.logical_and(tf.expand_dims(indices_a > 0, -1), tf.expand_dims(indices_b > 0, -2)),
-        #     similarities / norms,
-        #     tf.zeros_like(similarities),
-        #     name=f'{name}_synergies',
-        # )
-    return inner
-calc_internal_synergy = calculate_synergies('internal')
-calc_picked_synergy = calculate_synergies('picked')
-
-def gather_weights(name):
-    @tf.function(experimental_compile=True)
-    def inner(coord_weights, weights):
-        return tf.reshape(tf.reduce_sum(tf.cast(tf.math.sigmoid(weights), dtype=tf.float16)
-                                        * coord_weights, 1),
-                          (-1, 1), name=f'{name}_weights')
-    return inner
-gather_rating_weights = gather_weights('rating')
-gather_pick_synergy_weights = gather_weights('pick_synergy')
-gather_internal_synergy_weights = gather_weights('internal_synergy')
-gather_colors_weights = gather_weights('color')
-gather_openness_weights = gather_weights('openness')
-
-def gather_ratings(name):
-    @tf.function(experimental_compile=True)
-    def inner(ratings):
-        return tf.cast(tf.math.tanh(ratings), dtype=tf.float16, name=f'{name}_ratings')
-    return inner
-gather_pack_ratings = gather_ratings('in_pack')
-gather_picked_ratings = gather_ratings('picked')
-gather_seen_ratings = gather_ratings('seen')
-
-# @tf.function(experimental_compile=True)
-def calc_internal_synergy_score(prob_pickeds, picked_embeds, picked_card_indices, picked_counts, internal_synergy_weights):
-    internal_synergy_matrices = calc_internal_synergy(picked_embeds, picked_embeds, picked_card_indices,
-                                                           picked_card_indices)
-    total_probs = tf.reduce_sum(prob_pickeds, 2, name='total_probs') + tf.constant(1e-05, dtype=tf.float16)
-    return internal_synergy_weights * tf.reduce_sum(
-        (tf.expand_dims(prob_pickeds, 3) * tf.expand_dims(prob_pickeds, 2))
-        * tf.expand_dims(internal_synergy_matrices, 1),
-        [2, 3], name='internal_synergy_reduction'
-    ) / (total_probs * (picked_counts - 1)) # We guarantee picked_counts is at least 2
-
-def calc_weighted_sum_ratings(name):
-    @tf.function(experimental_compile=True)
-    def inner(ratings, probs, counts, weights):
-        return weights * tf.reduce_sum(tf.expand_dims(ratings, 1) * probs, 2, name=f'{name}_reduction') / counts
-    return inner
-calc_colors_score = calc_weighted_sum_ratings('colors')
-calc_openness_score = calc_weighted_sum_ratings('openness')
-
-@tf.function(experimental_compile=True)
-def calc_global_score(internal_synergy_scores, colors_scores, openness_scores):
-    return internal_synergy_scores + colors_scores + openness_scores
-
-# @tf.function(experimental_compile=True)
-def calc_pick_synergy_score(prob_pickeds, picked_counts, picked_embeds, picked_indices,
-                            pack_indices, pack_embeds, pick_synergy_weights):
-    picked_synergy_matrices = calc_picked_synergy(pack_embeds, picked_embeds, pack_indices, picked_indices)
-    return tf.reduce_sum(tf.expand_dims(prob_pickeds, 2) * tf.expand_dims(picked_synergy_matrices, 1), 3)\
-        / tf.expand_dims(picked_counts * pick_synergy_weights, -1) # Same as for internal_synergy_oracles
-
-@tf.function(experimental_compile=True)
-def calc_local_scores(pick_synergy_scores, in_pack_ratings, rating_weights, prob_in_packs):
-    return prob_in_packs * (tf.expand_dims(in_pack_ratings * rating_weights, 1, name='rating_score')
-                            + pick_synergy_scores)
-
-@tf.function(experimental_compile=True)
-def calc_choice_probs(local_scores, global_scores, temperature):
-    scores = tf.cast(local_scores + tf.expand_dims(global_scores, 2), dtype=tf.float64, name='scores')
-    exp_scores = 1 + tf.reduce_sum(tf.exp(temperature * scores, name='exp_land_scores'), 1, name='exp_scores')
-    return tf.cast(exp_scores / tf.expand_dims(tf.reduce_sum(exp_scores, 1), 1, name='total_exp_scores'),
-                   dtype=tf.float32, name='final_result')
+from .timeseries.timeseries import log_timeseries
 
 class DraftBot(tf.keras.models.Model):
-    def __init__(self, card_ratings, card_embeddings, temperature):
-        super(DraftBot, self).__init__()
-        self.rating_weights = tf.Variable(
-            np.random.uniform(-1, 1, (3, 15)),
-            dtype=tf.float32, name='rating_logit_weights',
+    def __init__(self, card_ratings, card_embeddings, temperature,
+                 internal_synergy_dropout_rate, pick_synergy_dropout_rate, float_type,
+                 debugging=False):
+        super(DraftBot, self).__init__(name='DraftBot')
+        self.float_type = float_type
+        print(self.float_type)
+        oracle_weights = np.random.uniform(0, 1, (3, 15, 5))
+        oracle_weights = tf.math.divide_no_nan(oracle_weights, tf.reduce_sum(oracle_weights, axis=2, keepdims=True))
+        self.oracle_weights = tf.Variable(
+            tf.cast(oracle_weights, dtype=tf.float32),
+            dtype=tf.float32, name='oracles_logit_weights'
         )
-        self.pick_synergy_weights = tf.Variable(
-            np.random.uniform(-1, 1, (3, 15)),
-            dtype=tf.float32, name='pick_synergy_logit_weights',
-        )
-        self.internal_synergy_weights = tf.Variable(
-            np.random.uniform(-1, 1, (3, 15)),
-            dtype=tf.float32, name='internal_synergy_logit_weights',
-        )
-        self.colors_weights = tf.Variable(
-            np.random.uniform(-1, 1, (3, 15)),
-            dtype=tf.float32, name='colors_logit_weights',
-        )
-        self.openness_weights = tf.Variable(
-            np.random.uniform(-1, 1, (3, 15)),
-            dtype=tf.float32, name='openness_logit_weights',
-        )
-        self.rating_mult = tf.constant([0] + [1 for _ in card_ratings[1:]], dtype=tf.float32)
+        self.num_cards = len(card_ratings)
+        self.rating_mult = tf.constant([0] + [1 for _ in card_ratings[1:]], dtype=float_type)
+        card_ratings = np.random.uniform(0, 10, len(card_ratings)),
+        card_ratings = tf.reshape(card_ratings, (-1,))
         self.ratings = tf.Variable(
-            tf.math.atanh(tf.minimum(card_ratings, 8) / 10),
+            tf.cast(card_ratings, dtype=tf.float32),
             dtype=tf.float32, name='card_ratings',
         )
-        self.card_embeddings = tf.Variable(card_embeddings, dtype=tf.float32, name='card_embeddings')
-        # We can multiply by 100 here instead of scaling the weights, ratings, and synergies later.
-        self.temperature = tf.constant(temperature * 100, dtype=tf.float64)
+        card_embeddings = np.random.uniform(-1, 1, (self.num_cards, len(card_embeddings[0])))
+        self.card_embeddings = tf.Variable(
+            tf.cast(
+                card_embeddings,
+                # tf.math.divide_no_nan(card_embeddings, tf.norm(card_embeddings, axis=1, keepdims=True)),
+                dtype=tf.float32),
+            dtype=tf.float32, name='card_embeddings')
+        self.temperature = tf.constant(temperature, dtype=self.float_type)
+        self.internal_synergy_dropout = tf.keras.layers.Dropout(internal_synergy_dropout_rate, dtype=self.float_type,
+                                                                name='internal_synergy_dropout')
+        self.pick_synergy_dropout = tf.keras.layers.Dropout(pick_synergy_dropout_rate, dtype=self.float_type,
+                                                            name='pick_synergy_dropout')
+        self.debugging = debugging
+        self.separate_gradients = True
 
-    def call(self, inputs):
+    def call(self, inputs, training=False):
         in_pack_card_indices, seen_indices, seen_counts,\
             picked_card_indices, picked_counts, coords, coord_weights,\
             prob_seen_matrices,\
             prob_picked_matrices, prob_in_pack_matrices = inputs
         in_pack_card_indices = tf.reshape(tf.cast(in_pack_card_indices, dtype=tf.int32), (-1, MAX_IN_PACK), name='in_packs')
         seen_indices = tf.reshape(tf.cast(seen_indices, dtype=tf.int32), (-1, MAX_SEEN), name='seens')
-        seen_counts = tf.reshape(tf.cast(seen_counts, dtype=tf.float16), (-1, 1), name='seen_counts')
+        seen_counts = tf.reshape(tf.cast(seen_counts, dtype=self.float_type), (-1, 1), name='seen_counts')
         picked_card_indices = tf.reshape(tf.cast(picked_card_indices, dtype=tf.int32), (-1, MAX_PICKED), name='pickeds')
-        picked_counts = tf.reshape(tf.cast(picked_counts, dtype=tf.float16), (-1, 1), name='picked_counts')
+        picked_counts = tf.reshape(tf.cast(picked_counts, dtype=self.float_type), (-1, 1), name='picked_counts')
         coords = tf.reshape(tf.cast(coords, dtype=tf.int32), (-1, 4, 2), name='coords')
-        coord_weights = tf.reshape(tf.cast(coord_weights, dtype=tf.float16), (-1, 4), name='coord_weights')
-        prob_seens = tf.reshape(tf.cast(prob_seen_matrices, dtype=tf.float16) / 255,
-                                (-1, NUM_LAND_COMBS, MAX_SEEN), name='prob_seens')
-        prob_pickeds = tf.reshape(tf.cast(prob_picked_matrices, dtype=tf.float16) / 255,
-                                  (-1, NUM_LAND_COMBS, MAX_PICKED), name='prob_pickeds')
-        prob_in_packs = tf.reshape(tf.cast(prob_in_pack_matrices, dtype=tf.float16) / 255,
-                                   (-1, NUM_LAND_COMBS, MAX_IN_PACK), name='prob_in_packs')
-        ratings = self.ratings * self.rating_mult
-        embeddings = self.card_embeddings * tf.expand_dims(self.rating_mult, 1)
-        picked_embeds = tf.cast(tf.gather(embeddings, picked_card_indices), name='picked_embeds', dtype=tf.float16)
-        in_pack_embeds = tf.cast(tf.gather(embeddings, in_pack_card_indices), name='in_pack_embeds', dtype=tf.float16)
-        in_pack_ratings = gather_pack_ratings(tf.gather(ratings, in_pack_card_indices))
-        picked_ratings = gather_picked_ratings(tf.gather(ratings, picked_card_indices))
-        seen_ratings = gather_seen_ratings(tf.gather(ratings, seen_indices))
-        rating_weights = gather_rating_weights(coord_weights, tf.gather_nd(self.rating_weights, coords))
-        pick_synergy_weights = gather_pick_synergy_weights(coord_weights, tf.gather_nd(self.pick_synergy_weights, coords))
-        internal_synergy_weights = gather_internal_synergy_weights(coord_weights, tf.gather_nd(self.internal_synergy_weights, coords))
-        colors_weights = gather_colors_weights(coord_weights, tf.gather_nd(self.colors_weights, coords))
-        openness_weights = gather_openness_weights(coord_weights, tf.gather_nd(self.openness_weights, coords))
+        coord_weights = tf.reshape(tf.cast(coord_weights, dtype=self.float_type), (-1, 4), name='coord_weights')
 
-        internal_synergy_score = calc_internal_synergy_score(prob_pickeds, picked_embeds, picked_card_indices,
-                                                             picked_counts, internal_synergy_weights)
-        colors_score = calc_colors_score(picked_ratings, prob_pickeds, picked_counts, colors_weights)
-        openness_score = calc_openness_score(seen_ratings, prob_seens, seen_counts, openness_weights)
-        global_scores = calc_global_score(internal_synergy_score, colors_score, openness_score)
-        pick_synergy_score = calc_pick_synergy_score(prob_pickeds, picked_counts,
-                                                     picked_embeds, picked_card_indices, in_pack_card_indices, in_pack_embeds,
-                                                     pick_synergy_weights)
-        local_scores = calc_local_scores(pick_synergy_score, in_pack_ratings, rating_weights, prob_in_packs)
-        return calc_choice_probs(local_scores, global_scores, self.temperature)
+        with tf.xla.experimental.jit_scope(compile_ops=not self.debugging, separate_compiled_gradients=self.separate_gradients):
+            prob_seens = tf.reshape(tf.cast(prob_seen_matrices, dtype=self.float_type) / 255,
+                                    (-1, NUM_LAND_COMBS, MAX_SEEN), name='prob_seens')
+            prob_pickeds = tf.reshape(tf.cast(prob_picked_matrices, dtype=self.float_type) / 255,
+                                      (-1, NUM_LAND_COMBS, MAX_PICKED), name='prob_pickeds')
+            prob_in_packs = tf.reshape(tf.cast(prob_in_pack_matrices, dtype=self.float_type) / 255,
+                                       (-1, NUM_LAND_COMBS, MAX_IN_PACK), name='prob_in_packs')
+            embeddings = tf.cast(self.card_embeddings, dtype=self.float_type) * tf.expand_dims(self.rating_mult, 1)
+            ratings = tf.cast(self.ratings, dtype=self.float_type, name='ratings')
+            # min_rating = tf.stop_gradient(tf.math.reduce_min(ratings[1:]))
+            # max_rating = tf.stop_gradient(tf.math.reduce_max(ratings))
+            min_rating = tf.stop_gradient(tf.math.reduce_min(ratings[1:]))
+            max_rating = tf.stop_gradient(tf.math.reduce_max(ratings))
+            ratings = self.rating_mult * (ratings - min_rating) / (max_rating - min_rating)
+            oracle_weights = tf.cast(self.oracle_weights, dtype=self.float_type)
+            # oracle_weights = tf.cast(tf.math.softplus(self.oracle_weights), dtype=self.float_type)
+            oracle_weights = oracle_weights - tf.stop_gradient(tf.reduce_min(oracle_weights, keepdims=True)) + 1e-2
+            oracle_weights = tf.math.divide_no_nan(oracle_weights, tf.reduce_sum(oracle_weights, axis=2, keepdims=True))
+
+        tf.summary.histogram('weights/oracle_weights', oracle_weights)
+        tf.summary.histogram('weights/card_ratings', ratings)
+        for i, name in enumerate(('ratings', 'pick_synergy', 'internal_synergy', 'colors', 'openness')):
+            log_timeseries(f'weights/{name}_weights', oracle_weights[:,:14,i], start_index=1)
+
+        oracle_weight_values = tf.gather_nd(oracle_weights, coords) # (-1, 4, 5)
+        picked_embeds = tf.gather(embeddings, picked_card_indices, name='picked_embeds')
+        in_pack_embeds = tf.gather(embeddings, in_pack_card_indices, name='in_pack_embeds')
+        picked_ratings = tf.gather(ratings, picked_card_indices)
+        in_pack_ratings = tf.gather(ratings, in_pack_card_indices)
+        seen_ratings = tf.gather(ratings, seen_indices)
+
+        with tf.xla.experimental.jit_scope(compile_ops=not self.debugging, separate_compiled_gradients=self.separate_gradients):
+            picked_squared_norm = tf.reduce_sum(picked_embeds * picked_embeds, 2, keepdims=True)
+            norm_picked_embeds = tf.where(picked_squared_norm > 0, tf.sqrt(picked_squared_norm), tf.zeros_like(picked_squared_norm), name='norm_picked_embeds')
+            scaled_picked_embeds = tf.math.divide_no_nan(picked_embeds, norm_picked_embeds)
+            in_pack_squared_norm = tf.reduce_sum(in_pack_embeds * in_pack_embeds, 2, keepdims=True)
+            norm_in_pack_embeds = tf.sqrt(in_pack_squared_norm)
+            norm_in_pack_embeds = tf.where(in_pack_squared_norm > 0, tf.sqrt(in_pack_squared_norm), tf.zeros_like(in_pack_squared_norm), name='norm_in_pack_embeds')
+
+            pick_synergies = tf.reduce_sum(tf.expand_dims(tf.math.divide_no_nan(in_pack_embeds, norm_in_pack_embeds), 2)
+                                                      * tf.expand_dims(scaled_picked_embeds, 1), -1)
+            pick_synergies = self.pick_synergy_dropout(pick_synergies * (1 - tf.eye(MAX_IN_PACK, num_columns=MAX_PICKED, dtype=self.float_type)), training=training)
+            internal_synergies = tf.reduce_sum(tf.expand_dims(scaled_picked_embeds, 2)
+                                               * tf.expand_dims(scaled_picked_embeds, 1), -1)
+            internal_synergies = self.internal_synergy_dropout(internal_synergies * (1 - tf.eye(MAX_PICKED, dtype=self.float_type)), training=training)
+            total_probs = tf.reduce_sum(prob_pickeds, 2, name='total_probs')
+
+        synergies = tf.reshape(tf.concat([internal_synergies, pick_synergies], 1), (-1,))
+        synergies = tf.boolean_mask(synergies, tf.math.abs(synergies) > 0)
+        tf.summary.histogram('values/synergies', synergies)
+
+        with tf.xla.experimental.jit_scope(compile_ops=not self.debugging, separate_compiled_gradients=self.separate_gradients):
+            rating_scores = prob_in_packs * tf.expand_dims(in_pack_ratings, 1)
+            pick_synergy_scores = tf.math.divide_no_nan(
+                prob_in_packs * tf.reduce_sum(tf.expand_dims(prob_pickeds, 2)
+                                              * tf.expand_dims(pick_synergies, 1), 3),
+                tf.expand_dims(picked_counts, -1)        # Same as for internal_synergy_oracles
+            )
+            internal_synergy_scores = tf.expand_dims(tf.math.divide_no_nan(tf.reduce_sum(
+                    (tf.expand_dims(prob_pickeds, 3) * tf.expand_dims(prob_pickeds, 2))
+                    * tf.expand_dims(internal_synergies, 1),
+                    [2, 3], name='internal_synergy_reduction'
+                ),
+                total_probs * (picked_counts - 1)
+            ), 2)
+            colors_scores = tf.expand_dims(
+                tf.math.divide_no_nan(tf.reduce_sum(tf.expand_dims(picked_ratings, 1) * prob_pickeds, 2), picked_counts), 2
+            )
+            openness_scores = tf.expand_dims(
+                tf.math.divide_no_nan(tf.reduce_sum(tf.expand_dims(seen_ratings, 1) * prob_seens, 2), seen_counts), 2
+            )
+
+            oracles_weights = tf.reshape(tf.reduce_sum(
+                oracle_weight_values * tf.expand_dims(coord_weights, 2), 1
+            ), (-1, 1, 1, 5), name=f'oracles_weights')
+            oracle_scores = tf.stack(tuple(scores + tf.zeros_like(rating_scores)
+                                           for scores in (rating_scores, pick_synergy_scores,
+                                                          internal_synergy_scores, colors_scores,
+                                                          openness_scores)),
+                                     axis=3, name='oracle_scores')
+            # We can multiply by 100 here instead of scaling the weights, ratings, and synergies earlier.
+            # We do want to scale them into the [0, 10] range though since that gives much nicer looking scores.
+            scores = tf.reduce_sum(oracle_scores * oracles_weights, -1, name='weighted_scores')
+            max_scores = tf.reduce_logsumexp(tf.cast(self.temperature * scores, dtype=tf.float32), 1, name='max_scores')
+            # tf.summary.histogram('outputs/max_scores', max_scores / self.temperature)
+            # tf.summary.histogram('outputs/true_max_scores', tf.reduce_max(max_scores, axis=1) / self.temperature)
+            # tf.summary.histogram('outputs/correct_max_scores', max_scores[:,0] / self.temperature)
+            choice_probs = tf.nn.softmax(max_scores, 1, name='choice_probs')
+            tf.summary.histogram('outputs/prob_correct', choice_probs[:,0])
+            tf.summary.histogram('outputs/probs_incorrect', choice_probs[:,1:])
+            # max_of_other = tf.reduce_logsumexp(self.temperature * max_scores[:,1:], 1) / self.temperature
+            return choice_probs
+            # return tf.cast(choice_probs, dtype=self.float_type)
+            # return (
+            #     choice_probs,
+            #     prob_correct,
+            #     # prob_correct
+            #     # (max_scores[:,0] - max_of_other) / max_scores[:,0]
+            # )

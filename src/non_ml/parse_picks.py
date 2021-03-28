@@ -7,31 +7,30 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-import numpy as np
-import tensorflow as tf
+logger = multiprocessing.get_logger()
 
-MAX_IN_PACK = 16
-MAX_SEEN = 360
-MAX_PICKED = 48
-NUM_LAND_COMBS = 32
+import numpy as np
+
+MAX_IN_PACK = 32
+MAX_SEEN = 512 # Almost enough for 4x16 packs (544)
+MAX_PICKED = 64
+NUM_LAND_COMBS = 8
 FEATURES = (
-    (np.int32, (MAX_IN_PACK,), 'in_packs'),
-    (np.int32, (MAX_SEEN,), 'seens'),
-    (np.float32, (), 'seen_counts'),
-    (np.int32, (MAX_PICKED,), 'pickeds'),
-    (np.float32, (), 'picked_counts'),
+    (np.uint16, (MAX_IN_PACK,), 'in_packs'), # int32 since you can't index with smaller or unsigned
+    (np.uint16, (MAX_SEEN,), 'seens'), # int32 same as for in_packs
+    (np.uint16, (), 'seen_counts'), # float16
+    (np.uint16, (MAX_PICKED,), 'pickeds'), # int32 same as for in_packs
+    (np.uint8, (), 'picked_counts'), # float16
     (np.int32, (4, 2), 'coords'),
-    (np.float32, (4,), 'coord_weights'),
-    (np.uint8, (NUM_LAND_COMBS, MAX_SEEN), 'prob_seens'),
-    (np.uint8, (NUM_LAND_COMBS, MAX_PICKED), 'prob_pickeds'),
-    (np.uint8, (NUM_LAND_COMBS, MAX_IN_PACK), 'prob_in_packs'),
+    (np.float32, (4,), 'coord_weights'), # TODO float16 and mult by 256 (we don't need to represent 1)
+    (np.uint8, (NUM_LAND_COMBS, MAX_SEEN), 'prob_seens'), # float16
+    (np.uint8, (NUM_LAND_COMBS, MAX_PICKED), 'prob_pickeds'), # float16
+    (np.uint8, (NUM_LAND_COMBS, MAX_IN_PACK), 'prob_in_packs'), # float16
 )
-COMPRESSION = 'GZIP'
-PICK_SIGNATURE = (tuple(tf.TensorSpec(shape=shape, dtype=dtype) for dtype, shape, _ in FEATURES),
-                  tf.TensorSpec(shape=(MAX_IN_PACK,)))
+COMPRESSION = None
 NUM_TRAIN_PICKS = 4096000
-NUM_TRAIN_SHARDS = 256
-NUM_TEST_SHARDS = 32
+NUM_TRAIN_SHARDS = 512
+NUM_TEST_SHARDS = 64
 FETCH_LANDS = {
     "arid mesa": ['r', 'w'],
     "bad river": ['u', 'b'],
@@ -60,9 +59,9 @@ COLOR_COMBINATIONS = [frozenset(list(c)) for c in
 COLOR_COMB_INDEX = { s: i for i, s in enumerate(COLOR_COMBINATIONS) }
 INTERSECTS_LIST = [frozenset([i for i, b in enumerate(COLOR_COMBINATIONS) if len(a & b) > 0]) for a in COLOR_COMBINATIONS]
 INTERSECTS_LOOKUP = { s: l for s, l in zip(COLOR_COMBINATIONS, INTERSECTS_LIST) }
+MAX_CMC = 8
 MAX_REQUIRED_A = 6
-
-logger = multiprocessing.get_logger()
+MAX_REQUIRED_B = 3
 
 
 def static_vars(**kwargs):
@@ -106,19 +105,56 @@ def load_card_data():
             if len(symbol_colors) > 0:
                 devotions[symbol_colors] = devotions.get(symbol_colors, 0) + 1
                 total_devotion += 1
-        cmc = min(max(card["cmc"], total_devotion), 8)
-        devotion_costs = (cmc, frozenset([(INTERSECTS_LOOKUP[frozenset(c)], v) for c, v in devotions.items()]))
-        if devotion_costs not in costs:
-            costs[devotion_costs] = len(costs)
-            costs_list.append(devotion_costs)
-        cost_index = costs[devotion_costs]
+        cmc = min(max(card["cmc"], total_devotion), MAX_CMC)
+        devotions = tuple((INTERSECTS_LOOKUP[frozenset(c)], v) for c, v in devotions.items())
+        dev_len = len(devotions)
+        if dev_len == 0:
+            cost_index = -1
+        else:
+            if dev_len == 1:
+                devotion_costs = (cmc, ((tuple(sorted(devotions[0][0])), min(devotions[0][1], MAX_REQUIRED_A)),))
+            if dev_len == 2:
+                colors_a, count_a = devotions[0]
+                colors_b, count_b = devotions[1]
+                if count_b > count_a:
+                    colors_a, colors_b = colors_b, colors_a
+                    count_a, count_b = count_b, count_a
+                colors_ab = colors_a & colors_b
+                colors_a, colors_b = colors_a - colors_b, colors_b - colors_a
+                count_a, count_b = min(count_a, MAX_REQUIRED_A), min(count_b, MAX_REQUIRED_B)
+                devotions_costs = (cmc, ((tuple(sorted(colors_a)), count_a),
+                                         (tuple(sorted(colors_b)), count_b),
+                                         tuple(sorted(colors_ab))))
+            if dev_len > 2:
+                mono_colors = devotions
+                full_colors = set()
+                full_count = 0
+                for colors, count in devotions:
+                    full_colors = full_colors | colors
+                    full_count += count
+                devotions_list = [*mono_colors, (full_colors, full_count)]
+                devotions = []
+                for colors, count in devotions_list:
+                    colors = tuple(sorted(colors))
+                    count = min(count, MAX_REQUIRED_A)
+                    sub_cost = (cmc, ((colors, count),))
+                    if sub_cost not in costs:
+                        costs[sub_cost] = len(costs_list)
+                        costs_list.append(sub_cost)
+                    devotions.append((costs[sub_cost], *sub_cost))
+                devotion_costs = (0, tuple(sorted(devotions)))
+            
+            if devotion_costs not in costs:
+                costs[devotion_costs] = len(costs_list)
+                costs_list.append(devotion_costs)
+            cost_index = costs[devotion_costs]
         card_devotions.append(cost_index)
-    logger.info("Populated all card data")
+    logger.info(f"Populated all card data. There were {len(costs_list)} unique costs.")
     return card_devotions, card_colors, costs_list
 
 
 def load_prob_table():
-    prob_table = np.full((9, 7, 4, 18, 18, 18), 0, dtype=np.float32)
+    prob_table = np.full((MAX_CMC + 1, MAX_REQUIRED_A + 1, MAX_REQUIRED_B + 1, 18, 18, 18), 0, dtype=np.float32)
     prob_table_json = []
     with open('data/probTable.json', 'r') as prob_file:
         prob_table_json = json.load(prob_file)
@@ -134,56 +170,36 @@ def load_prob_table():
     return prob_table
 
 
-def prob_to_cast_0(*args):
-    return 1
-
-
-def prob_to_cast_1(devotions, cmc, lands, lands_set, prob_table):
-    colors = devotions[0][0] & lands_set
+def prob_to_cast_1(devotions, cmc, lands, lands_set, prob_table, prob_cache, lands_index, lands_list):
+    colors = devotions[0][0]
+    # colors = colors & lands_set
     usable_count = sum(lands[c] for c in colors)
     return prob_table[cmc, min(MAX_REQUIRED_A, devotions[0][1]), 0, usable_count, 0, 0]
 
 
-def prob_to_cast_2(devotions, cmc, lands, lands_set, prob_table):
+def prob_to_cast_2(devotions, cmc, lands, lands_set, prob_table, prob_cache, lands_index, lands_list):
     colors_a, count_a = devotions[0]
     colors_b, count_b = devotions[1]
-    colors_a = colors_a & lands_set
-    colors_b = colors_b & lands_set
-    if count_b > count_a:
-        colors_a, colors_b = colors_b, colors_a
-        count_a, count_b = count_b, count_a
-    idx_a = colors_a - colors_b
-    idx_b = colors_b - colors_a
-    idx_ab = colors_a & colors_b
-    usable_count_a = sum(lands[c] for c in idx_a)
-    usable_count_b = sum(lands[c] for c in idx_b)
-    usable_count_ab = sum(lands[c] for c in idx_ab)
+    colors_ab = devotions[2]
+    # colors_a, colors_b, colors_ab = colors_a & lands_set, colors_b & lands_set, colors_ab & lands_set
+    usable_count_a = sum(lands[c] for c in colors_a)
+    usable_count_b = sum(lands[c] for c in colors_b)
+    usable_count_ab = sum(lands[c] for c in colors_ab)
     return prob_table[cmc, min(MAX_REQUIRED_A, count_a), count_b, usable_count_a, usable_count_b, usable_count_ab]
 
 
-def prob_to_cast_3(devotions, cmc, lands, lands_set, prob_table):
-    total_devotion = 0
-    prob = 1
-    usable_land_colors = set()
-    for colors, count in devotions:
-        colors = colors & lands_set
-        total_devotion += count
-        usable_count = sum([lands[c] for c in colors])
-        usable_land_colors = usable_land_colors | colors
-        prob *= prob_table[cmc, min(MAX_REQUIRED_A, count), 0, usable_count, 0, 0] / 255
-    usable_count = sum([lands[c] for c in usable_land_colors])
-    return prob * prob_table[cmc, min(MAX_REQUIRED_A, total_devotion), 0, usable_count, 0, 0]
+def prob_to_cast_many(devotions, cmc, lands, lands_set, prob_table, prob_cache, lands_index, lands_list):
+    return np.prod([prob_to_cast(ci, prob_cache, prob_to_cast_1, devotion, cmc, lands_index, prob_table, lands_list) / 255
+                    for ci, cmc, devotion in devotions]) * 255
+
+PROB_TO_CAST_BY_COUNT = (None, prob_to_cast_1, None, prob_to_cast_2, prob_to_cast_many, prob_to_cast_many, prob_to_cast_many)
 
 
-PROB_TO_CAST_BY_COUNT = (prob_to_cast_0, prob_to_cast_1, prob_to_cast_2, prob_to_cast_3, prob_to_cast_3, prob_to_cast_3)
-
-
-def prob_to_cast(cost_index, probs_by_land, prob_func, devotions, cmc, lands_index, prob_table, lands_list):
-    if lands_index not in probs_by_land:
-        devotions = tuple(devotions)
+def prob_to_cast(cost_index, prob_cache, prob_func, devotions, cmc, lands_index, prob_table, lands_list):
+    if cost_index not in prob_cache:
         lands, lands_set = lands_list[lands_index]
-        probs_by_land[lands_index] = prob_func(devotions, cmc, lands, lands_set, prob_table)
-    return probs_by_land[lands_index]
+        prob_cache[cost_index] = prob_func(devotions, cmc, lands, lands_set, prob_table, prob_cache, lands_index, lands_list)
+    return prob_cache[cost_index]
 
 
 def lands_base(picked, card_colors):
@@ -211,17 +227,19 @@ def random_basics(n):
 
 
 @static_vars(prob_cache=None, possible_lands={}, lands_list=[])
-def generate_probs(picked, seen, in_pack, costs_list, card_devotions, card_colors, prob_table, total=120, total_tries=256):
+def generate_probs(picked, seen, in_pack, costs_list, card_devotions, card_colors, prob_table, total_climbs=NUM_LAND_COMBS):
     if generate_probs.prob_cache is None:
-        generate_probs.prob_cache = [{} for _ in costs_list]
+        generate_probs.prob_cache = {}
     base_lands, remaining = lands_base(picked, card_colors)
-    heap = []
+    heap = [(0, 0, 0, 0, ([0 for _ in seen], [0 for _ in picked], [0 for _ in in_pack]), -1) for _ in range(NUM_LAND_COMBS)]
     picked_costs, seen_costs, in_pack_costs = [[card_devotions[c] for c in cl] for cl in (picked, seen, in_pack)]
     costs = (picked_costs, seen_costs, in_pack_costs)
     picked_counter, seen_counter = [Counter(c for c in cs if c >= 0) for cs in (picked_costs, seen_costs)]
-    in_pack_set = frozenset(c for c in in_pack_costs if c >= 0)
-    costs_to_calc = [(c, generate_probs.prob_cache[c], PROB_TO_CAST_BY_COUNT[len(costs_list[c][1])], *costs_list[c])
-                     for c in frozenset(picked_costs + seen_costs + in_pack_costs) if c != -1]
+    in_pack_set = tuple(set(c for c in in_pack_costs if c >= 0))
+    if len(in_pack_set) == 0:
+        in_pack_set = (-1,)
+    costs_to_calc = tuple((c, PROB_TO_CAST_BY_COUNT[len(costs_list[c][1])], *costs_list[c])
+                          for c in frozenset(picked_costs + seen_costs + in_pack_costs) if c != -1)
     probs = { -1: 0 }
     if remaining <= 0:
         new_lands = tuple(base_lands)
@@ -229,20 +247,24 @@ def generate_probs(picked, seen, in_pack, costs_list, card_devotions, card_color
             generate_probs.possible_lands[new_lands] = len(generate_probs.lands_list)
             generate_probs.lands_list.append((new_lands, frozenset([i for i, x in enumerate(new_lands) if x > 0])))
         lands_index = generate_probs.possible_lands[new_lands]
-        probs.update({ c: prob_to_cast(c, cache, prob_func, devotions, cmc, lands_index, prob_table, generate_probs.lands_list)
-                       for c, cache, prob_func, cmc, devotions in costs_to_calc })
+        if lands_index not in generate_probs.prob_cache:
+            generate_probs.prob_cache[lands_index] = {}
+        prob_by_cost = generate_probs.prob_cache[lands_index]
+        probs.update({ c: prob_to_cast(c, prob_by_cost, prob_func, devotions, cmc, lands_index, prob_table, generate_probs.lands_list)
+                       for c, prob_func, cmc, devotions in costs_to_calc })
         picked_probs, seen_probs, in_pack_probs = [[probs[c] for c in cs] for cs in costs]
-        heap = [(0, 0, 0, 0, 0, (seen_probs, picked_probs, in_pack_probs))]
-        total_tries = 0
-    while total_tries > 0:
+        heap[0] = (0, 0, 0, 0, (seen_probs, picked_probs, in_pack_probs), 0)
+        total_climbs = 0
+    visited = set()
+    for loop in range(total_climbs):
         base_lands[1:6] = random_basics(remaining)
-        prev_best, prev_lands, prev_add, prev_cut = -1, tuple(base_lands), -1, -1
-        next_best, next_lands, next_add, next_cut = 0, prev_lands, -1, -1
-        while next_best > prev_best and total_tries > 0:
-            prev_best, prev_lands, prev_add, prev_cut = next_best, next_lands, next_add, next_cut
+        prev_best, prev_lands = -1, tuple(base_lands)
+        next_best, next_lands = 0, prev_lands
+        while next_best > prev_best:
+            prev_best, prev_lands = next_best, next_lands
             for add in range(1, 6):
                 for cut in range(1, 6):
-                    if add == cut or add == prev_cut or prev_lands[cut] == 0 or cut == prev_add:
+                    if add == cut or prev_lands[cut] == 0:
                         continue
                     new_lands = list(prev_lands)
                     new_lands[add] += 1
@@ -250,28 +272,28 @@ def generate_probs(picked, seen, in_pack, costs_list, card_devotions, card_color
                     new_lands = tuple(new_lands)
                     if new_lands not in generate_probs.possible_lands:
                         generate_probs.possible_lands[new_lands] = len(generate_probs.lands_list)
-                        generate_probs.lands_list.append((new_lands, frozenset([i for i, x in enumerate(new_lands) if x > 0])))
+                        generate_probs.prob_cache[len(generate_probs.lands_list)] = {}
+                        generate_probs.lands_list.append((new_lands, frozenset(i for i, x in enumerate(new_lands) if x > 0)))
                     lands_index = generate_probs.possible_lands[new_lands]
-                    probs.update({ c: prob_to_cast(c, cache, prob_func, devotions, cmc, lands_index, prob_table, generate_probs.lands_list)
-                                   for c, cache, prob_func, cmc, devotions in costs_to_calc })
+                    if lands_index in visited:
+                        continue
+                    visited.add(lands_index)
+                    prob_by_cost = generate_probs.prob_cache[lands_index]
+                    probs.update({ c: prob_to_cast(c, prob_by_cost, prob_func, devotions, cmc, lands_index, prob_table, generate_probs.lands_list)
+                                   for c, prob_func, cmc, devotions in costs_to_calc })
                     picked_probs, seen_probs, in_pack_probs = [[probs[c] for c in cs] for cs in costs]
                     total_picked_prob, total_seen_prob = [sum(v * probs[c] for c, v in cs.items()) for cs in (picked_counter, seen_counter)]
                     max_in_pack_prob = max(probs[c] for c in in_pack_set)
-                    total_score = total_picked_prob + max_in_pack_prob * 2 + total_seen_prob / 16
-                    entry = (total_score, total_picked_prob, max_in_pack_prob, total_seen_prob, total_tries,
-                             (seen_probs, picked_probs, in_pack_probs))
-                    if len(heap) < total:
-                        heapq.heappush(heap, entry)
-                    else:
-                        heapq.heappushpop(heap, entry)
-                    total_tries -= 1
-                    if total_tries <= 0 or total_score > next_best:
+                    total_score = total_picked_prob + max_in_pack_prob * 4 + total_seen_prob / 32
+                    entry = (total_score, total_picked_prob, max_in_pack_prob, total_seen_prob,
+                             (seen_probs, picked_probs, in_pack_probs), lands_index)
+                    heapq.heappushpop(heap, entry)
+                    if total_score > next_best:
                         next_add, next_cut, next_best, next_lands = add, cut, total_score, new_lands
                         break
-                if next_best > prev_best or total_tries <= 0:
+                if next_best > prev_best:
                     break
-    result = [e[5] for e in heap] + [([0 for _ in seen], [0 for _ in picked], [0 for _ in in_pack]) for _ in range(total - len(heap))]
-    return [np.uint8(arr) for arr in zip(*result)]
+    return [np.uint8(tuple(arr)) for arr in zip(*[e[4] for e in heap])]
 
 
 def to_one_hot(item, num_items):
@@ -282,16 +304,26 @@ def to_one_hot(item, num_items):
     return result
 
 
-def load_pick(pick, costs_list, card_devotions, card_colors, prob_table, num_land_combs=16, num_land_tries=50):
-    chosen_card = [1 if c == pick['chosenCard'] else 0 for c in in_pack]
-    if (not (2 <= len(pick['cardsInPack']) <= 16 and 1 <= len(pick['seen']) <= 360 and 2 <= len(pick['picked']) <= 48))\
-            or None in pick['seen'] or None in pick['picked'] or None in pick['cardsInPack']\
-            or all(x == 0 for x in chosen_card):
+def load_pick(pick, costs_list, card_devotions, card_colors, prob_table, num_climbs=None):
+    if len(pick['seen']) > MAX_SEEN or None in pick['seen']:
+        logger.debug(f'Seen was invalid ({len(pick["seen"])}).')
         return None
-    seen, picked, in_pack = [[c + 1 for c in pick[k]] for k in ('seen', 'picked', 'cardsInPack')]
-    in_pack = in_pack + [0 for _ in range(16 - len(in_pack))]
-    seen, seen_count = seen + [0 for _ in range(360 - len(seen))], len(seen)
-    picked, picked_count = picked + [0 for _ in range(48 - len(picked))], len(picked)
+    if len(pick['picked']) > MAX_PICKED or None in pick['picked']:
+        logger.debug(f'Picked was invalid ({len(pick["picked"])}).')
+        return None
+    if None in pick['cardsInPack'] or pick['chosenCard'] not in pick['cardsInPack']:
+        logger.debug(f'Picked was invalid {pick["cardsInPack"]} with chosen card {pick["chosenCard"]}.')
+        return None
+    in_pack = [pick['chosenCard'] + 1, *(c + 1 for c in set(pick['cardsInPack']) if c != pick['chosenCard'])]
+    if len(in_pack) > MAX_IN_PACK:
+        logger.debug(f'Too many cards in pack({len(in_pack)}).')
+        return None
+    if len(in_pack) < 2:
+        return None
+    seen, picked = [[c + 1 for c in pick[k]] for k in ('seen', 'picked')]
+    in_pack = in_pack + [0 for _ in range(MAX_IN_PACK - len(in_pack))]
+    seen, seen_count = seen + [0 for _ in range(MAX_SEEN - len(seen))], len(seen)
+    picked, picked_count = picked + [0 for _ in range(MAX_PICKED - len(picked))], len(picked)
     pack_num, packs_count, pick_num, pack_size = pick['pack'], pick['packs'], pick['pick'], pick['packSize']
     pack_float, pick_float = 3 * pack_num / packs_count, 15 * pick_num / pack_size
     pack_0, pack_1, pack_frac = int(pack_float), min(2, int(pack_float) + 1), pack_float - int(pack_float)
@@ -299,78 +331,108 @@ def load_pick(pick, costs_list, card_devotions, card_colors, prob_table, num_lan
     coords = ((pack_0, pick_0), (pack_0, pick_1), (pack_1, pick_0), (pack_1, pick_1))
     coord_weights = ((1 - pack_frac) * (1 - pick_frac), (1 - pack_frac) * pick_frac, pack_frac * (1 - pick_frac), pack_frac * pick_frac)
     prob_seen, prob_picked, prob_in_pack = generate_probs(picked, seen, in_pack, costs_list, card_devotions,
-                                                          card_colors, prob_table, num_land_combs, num_land_tries)
-    pick_data = [feature[0](value) for feature, value in zip(FEATURES, (in_pack, seen, seen_count,
+                                                          card_colors, prob_table, num_climbs)
+    return tuple(feature[0](value) for feature, value in zip(FEATURES, (in_pack, seen, seen_count,
                                                                         picked, picked_count, coords,
                                                                         coord_weights, prob_seen,
-                                                                        prob_picked, prob_in_pack))]
-    return (pick_data, chosen_card)
+                                                                        prob_picked, prob_in_pack)))
+
+@static_vars(parsed=0, total_usable=0, total_in_file=0)
+def parse_picks(pool, costs_list, card_devotions, card_colors, prob_table, num_climbs=None):
+    def inner(pick_file_name):
+        pick_file_name = pick_file_name.decode('utf-8')
+        pick_file_basename = Path(pick_file_name).stem
+        logger.debug(f'Started next file: {pick_file_basename}.')
+        parsed_data = []
+        draftNum = 0
+        pick_file_json = []
+        in_file = 0
+        usable = 0
+        with open(pick_file_name, 'r') as pf:
+            pick_file_json = json.load(pf)
+        # pick_file_json = json.loads(pick_file_contents)
+        loading_data = None
+        loaded_data = []
+        for draft_entry in pick_file_json:
+            if loading_data is not None:
+                loading_data.wait()
+                loaded_data = loading_data.get()
+            loading_data = pool.starmap_async(load_pick, [(p, costs_list, card_devotions, card_colors, prob_table, num_climbs)
+                                                         for p in draft_entry['picks']], 15)
+            in_file += len(draft_entry['picks'])
+            for loaded_pick in loaded_data:
+                if loaded_pick is not None:
+                    yield loaded_pick
+                    usable += 1
+            draftNum += 1
+        parse_picks.parsed += 1
+        parse_picks.total_usable += usable
+        parse_picks.total_in_file += in_file
+        total_percent = parse_picks.total_usable / parse_picks.total_in_file
+        usable_percent = usable / in_file
+        parsed, total_usable, total_in_file = parse_picks.parsed, parse_picks.total_usable, parse_picks.total_in_file
 
 
-def parse_picks(pick_file_name, pool, costs_list, card_devotions, card_colors, prob_table, num_land_combs=16, num_land_tries=50):
-    logger.info(f'Started parsing {pick_file_name}')
-    parsed_data = []
-    draftNum = 0
-    pick_file_json = []
-    with open(pick_file_name, 'r') as pick_file:
-        pick_file_json = json.load(pick_file)
-    for draft_entry in pick_file_json:
-        for pick in draft_entry["picks"]:
-            loaded_data = pool.apply(load_pick, (pick, costs_list, card_devotions, card_colors, prob_table, num_land_combs, num_land_tries))
-            if loaded_data is not None:
-                yield loaded_data
-        draftNum += 1
-        logger.debug(f'Completed draft {draftNum} and pick {len(parsed_data)}')
-    logger.info(f'Parsed {pick_file_name} which had {len(parsed_data)} usable picks.')
+        logger.info(f'Parsed #{parsed:04d} with {usable:04d}/{in_file:04d}({usable_percent:02.2%}) usable picks for a total of {total_usable:06d}/{total_in_file:06d}({total_percent:02.2%}).')
+    return inner
 
-    return [feature[0](parsed) for feature, parsed in zip(FEATURES, zip(*parsed_data))]
-
-
-def picks_dataset(num_land_combs, num_land_tries, num_workers=None):
+def picks_dataset(num_climbs=NUM_LAND_COMBS, proc_pool=None, num_workers=None, tf=None):
     card_devotions, card_colors, costs_list = load_card_data()
     prob_table = load_prob_table()
-    proc_pool = multiprocess.Pool(num_workers)
-    shared_params = (proc_pool, costs_list, card_devotions, card_colors, prob_table, num_land_combs, num_land_tries)
-    return tf.data.Dataset.from_files('data/drafts/*.json').interleave(
-        lambda filename: tf.data.Dataset.from_generator(lambda: parse_picks(filename, *shared_params),
-                                                        output_signature=PICK_SIGNATURE),
-        num_parallel_calls=tf.data.AUTOTUNE
+    gen = parse_picks(proc_pool, costs_list, card_devotions, card_colors, prob_table, num_climbs)
+    print(num_workers)
+    return tf.data.Dataset.list_files('data/drafts/*.json').interleave(
+        lambda name: tf.data.Dataset.from_generator(gen, args=(name,),
+                                                    output_signature=tuple(tf.TensorSpec(shape=shape, dtype=dtype) for dtype, shape, _ in FEATURES)
+        ).prefetch(tf.data.AUTOTUNE),
+        cycle_length=num_workers, num_parallel_calls=tf.data.AUTOTUNE
     ).shuffle(2**15).enumerate().prefetch(tf.data.AUTOTUNE)
 
-def load_picks(cache_dir, batch_size):
+def load_picks(cache_dir, batch_size, num_workers=128):
+    import tensorflow as tf
+    default_target = np.float64([1] + [0 for _ in range(MAX_IN_PACK - 1)])
+    default_true = np.float64(1)
     return tf.data.experimental.load(
         str(cache_dir),
-        (tf.TensorSpec(shape=(), dtype=tf.int64), PICK_SIGNATURE),
+        ((tf.TensorSpec(shape=(), dtype=tf.int64), tf.TensorSpec(shape=(), dtype=tf.int64)), tuple(tf.TensorSpec(shape=shape, dtype=dtype) for dtype, shape, _ in FEATURES)),
         compression=COMPRESSION,
-        reader_func=lambda ds: ds.shuffle(NUM_TRAIN_SHARDS).interleave(lambda x: x, num_parallel_calls=tf.data.AUTOTUNE)
-    ).map(lambda _, y: y).shuffle(32 * batch_size).batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
+        reader_func=lambda ds: ds.shuffle(NUM_TRAIN_SHARDS).interleave(lambda x: x, cycle_length=num_workers, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
+    ).shuffle(16 * batch_size).map(lambda _, y: y).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
 if __name__ == '__main__':
-    formatter = logging.Formatter('[%(levelname)s/%(processName)s] %(message)s')
+    formatter = logging.Formatter('{asctime} [{levelname}] {message}', style='{')
     handler = logging.StreamHandler()
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
+    num_workers = int(sys.argv[1])
+    with multiprocessing.Pool(num_workers) as proc_pool:
+        pick_cache_dir = Path('data/parsed_picks/')
+        import tensorflow as tf
+        full_dataset = picks_dataset(proc_pool=proc_pool, num_workers=num_workers, tf=tf)
 
-    num_land_tries = int(sys.argv[1])
-    num_workers = int(sys.argv[2])
+        full_cache_dir = pick_cache_dir / 'compressed_full'
+        full_cache_dir.mkdir(exist_ok=True, parents=True)
+        tf.data.experimental.save(full_dataset, str(full_cache_dir),
+                                  compression='GZIP',
+                                  shard_func=lambda x, _: x % NUM_TRAIN_SHARDS)
 
-    pick_cache_dir = Path('data/parsed_picks/')
-    main_dataset = picks_dataset(NUM_LAND_COMBS, num_land_tries, num_workers)
+        full_dataset = tf.data.experimental.load(
+            str(full_cache_dir),
+            (tf.TensorSpec(shape=(), dtype=tf.int64), tuple(tf.TensorSpec(shape=shape, dtype=dtype) for dtype, shape, _ in FEATURES)),
+            compression='GZIP',
+        ).map(lambda _, y: y).enumerate().prefetch(tf.data.AUTOTUNE)
 
-    train_cache_dir = pick_cache_dir / 'train'
-    train_cache_dir.mkdir(exist_ok=True)
-    train_dataset = main_dataset.take(NUM_TRAIN_PICKS).enumerate()
-    tf.data.experimental.save(train_dataset, str(train_cache_dir),
-                              compression=COMPRESSION,
-                              shard_func=lambda x, _: x % NUM_TRAIN_SHARDS)
+        train_cache_dir = pick_cache_dir / 'train'
+        train_cache_dir.mkdir(exist_ok=True)
+        train_dataset = full_dataset.take(NUM_TRAIN_PICKS)
+        tf.data.experimental.save(train_dataset, str(train_cache_dir),
+                                  compression=COMPRESSION,
+                                  shard_func=lambda x, _: x % NUM_TRAIN_SHARDS)
 
-    test_cache_dir = pick_cache_dir / 'test'
-    test_cache_dir.mkdir(exist_ok=True)
-    test_dataset = main_dataset.skip(NUM_TRAIN_PICKS).enumerate()
-    tf.data.experimental.save(test_dataset, str(test_cache_dir),
-                              compression=COMPRESSION,
-                              shard_func=lambda x, _: x % NUM_TEST_SHARDS)
-
-    parse_all_picks(Path('data/parsed_picks/'), num_land_combs, num_land_tries, num_workers)
+        test_cache_dir = pick_cache_dir / 'test'
+        test_cache_dir.mkdir(exist_ok=True)
+        test_dataset = full_dataset.skip(NUM_TRAIN_PICKS)
+        tf.data.experimental.save(test_dataset, str(test_cache_dir),
+                                  compression=COMPRESSION,
+                                  shard_func=lambda x, _: x % NUM_TEST_SHARDS)

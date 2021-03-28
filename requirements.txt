@@ -12,11 +12,11 @@ catalogue==2.0.1
 certifi==2019.11.28
 chardet==3.0.4
 click==7.1.2
+colorama==0.4.4
 cycler==0.10.0
 cymem==2.0.5
 decorator==4.4.2
 dill==0.3.3
-flatbuffers==1.12
 future==0.18.2
 gast==0.3.3
 google-auth==1.13.1
@@ -24,6 +24,7 @@ google-auth-oauthlib==0.4.1
 google-pasta==0.2.0
 googleapis-common-protos==1.53.0
 grpcio==1.32.0
+gviz-api==1.9.0
 h5py==2.10.0
 idna==2.9
 importlib-resources==5.1.2
@@ -42,7 +43,7 @@ MarkupSafe==1.1.1
 matplotlib==3.2.2
 murmurhash==1.0.5
 networkx==2.4
-numpy==1.18.5
+numpy==1.19.5
 oauthlib==3.1.0
 opt-einsum==3.3.0
 packaging==20.9
@@ -53,7 +54,6 @@ pickleshare==0.7.5
 preshed==3.0.5
 promise==2.3
 prompt-toolkit==3.0.5
-protobuf==3.15.6
 ptyprocess==0.6.0
 pyasn1==0.4.8
 pyasn1-modules==0.2.8
@@ -69,15 +69,15 @@ scipy==1.4.1
 six==1.15.0
 smart-open==3.0.0
 soupsieve==2.0
-spacy==3.0.5
 spacy-legacy==3.0.1
 srsly==2.4.0
 tensorboard==2.4.1
+tensorboard-plugin-profile==2.4.0
 tensorboard-plugin-wit==1.7.0
-tensorflow==2.3.0
+tensorflow==2.4.1
 tensorflow-addons==0.12.1
 tensorflow-datasets==4.2.0
-tensorflow-estimator==2.3.0
+tensorflow-estimator==2.4.0
 tensorflow-metadata==0.28.0
 termcolor==1.1.0
 thinc==8.0.2
@@ -93,3 +93,4 @@ wasabi==0.8.2
 wcwidth==0.1.9
 Werkzeug==1.0.1
 wrapt==1.12.1
+

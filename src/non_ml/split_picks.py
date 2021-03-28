@@ -4,12 +4,7 @@ import numpy as np
 import tensorflow as tf
 
 from ..ml.generator import DraftBotGenerator
-from .parse_picks import FEATURES, MAX_IN_PACK
-
-COMPRESSION = 'GZIP'
-NUM_TRAIN_PICKS = 4096000
-NUM_TRAIN_SHARDS = 256
-NUM_TEST_SHARDS = 32
+from .parse_picks import FEATURES, MAX_IN_PACK, COMPRESSION, NUM_TRAIN_PICKS, NUM_TRAIN_SHARDS, NUM_TEST_SHARDS
 
 if __name__ == '__main__':
     pick_cache_dir = Path('data/parsed_picks/')
