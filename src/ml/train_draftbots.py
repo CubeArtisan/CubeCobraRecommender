@@ -160,9 +160,9 @@ if __name__ == "__main__":
     es_callback = tf.keras.callbacks.EarlyStopping(monitor='categorical_accuracy', patience=8,
                                                    mode='max', restore_best_weights=True, verbose=True)
     lr_callback = tf.keras.callbacks.ReduceLROnPlateau(monitor='categorical_accuracy', factor=0.5, mode='max',
-                                                       patience=2, min_delta=1/(2**8), cooldown=1, min_lr=1/(2**13), verbose=True)
+                                                       patience=4, min_delta=1/(2**8), cooldown=2, min_lr=1/(2**13), verbose=True)
     tb_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=0, write_graph=True,
-                                                 update_freq=20, embeddings_freq=0, profile_batch=(602, 627))
+                                                 update_freq=25, embeddings_freq=0, profile_batch=(22, 54))
     hp_callback = hp.KerasCallback(log_dir, hparams)
     draftbots.fit(
         tf.data.Dataset.zip((train_dataset, train_ys)),

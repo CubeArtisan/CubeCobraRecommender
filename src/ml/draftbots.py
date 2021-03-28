@@ -19,7 +19,7 @@ class DraftBot(tf.keras.models.Model):
         )
         self.num_cards = len(card_ratings)
         self.rating_mult = tf.constant([0] + [1 for _ in card_ratings[1:]], dtype=float_type)
-        card_ratings = np.random.uniform(0, 10, len(card_ratings)),
+        # card_ratings = np.random.uniform(0, 10, len(card_ratings)),
         card_ratings = tf.reshape(card_ratings, (-1,))
         self.ratings = tf.Variable(
             tf.cast(card_ratings, dtype=tf.float32),
@@ -54,11 +54,11 @@ class DraftBot(tf.keras.models.Model):
         coord_weights = tf.reshape(tf.cast(coord_weights, dtype=self.float_type), (-1, 4), name='coord_weights')
 
         with tf.xla.experimental.jit_scope(compile_ops=not self.debugging, separate_compiled_gradients=self.separate_gradients):
-            prob_seens = tf.reshape(tf.cast(prob_seen_matrices, dtype=self.float_type) / 255,
+            prob_seens = tf.reshape(tf.cast(prob_seen_matrices, dtype=self.float_type),
                                     (-1, NUM_LAND_COMBS, MAX_SEEN), name='prob_seens')
-            prob_pickeds = tf.reshape(tf.cast(prob_picked_matrices, dtype=self.float_type) / 255,
+            prob_pickeds = tf.reshape(tf.cast(prob_picked_matrices, dtype=self.float_type),
                                       (-1, NUM_LAND_COMBS, MAX_PICKED), name='prob_pickeds')
-            prob_in_packs = tf.reshape(tf.cast(prob_in_pack_matrices, dtype=self.float_type) / 255,
+            prob_in_packs = tf.reshape(tf.cast(prob_in_pack_matrices, dtype=self.float_type),
                                        (-1, NUM_LAND_COMBS, MAX_IN_PACK), name='prob_in_packs')
             embeddings = tf.cast(self.card_embeddings, dtype=self.float_type) * tf.expand_dims(self.rating_mult, 1)
             ratings = tf.cast(self.ratings, dtype=self.float_type, name='ratings')
@@ -89,27 +89,27 @@ class DraftBot(tf.keras.models.Model):
             norm_picked_embeds = tf.where(picked_squared_norm > 0, tf.sqrt(picked_squared_norm), tf.zeros_like(picked_squared_norm), name='norm_picked_embeds')
             scaled_picked_embeds = tf.math.divide_no_nan(picked_embeds, norm_picked_embeds)
             in_pack_squared_norm = tf.reduce_sum(in_pack_embeds * in_pack_embeds, 2, keepdims=True)
-            norm_in_pack_embeds = tf.sqrt(in_pack_squared_norm)
             norm_in_pack_embeds = tf.where(in_pack_squared_norm > 0, tf.sqrt(in_pack_squared_norm), tf.zeros_like(in_pack_squared_norm), name='norm_in_pack_embeds')
-
             pick_synergies = tf.reduce_sum(tf.expand_dims(tf.math.divide_no_nan(in_pack_embeds, norm_in_pack_embeds), 2)
                                                       * tf.expand_dims(scaled_picked_embeds, 1), -1)
-            pick_synergies = self.pick_synergy_dropout(pick_synergies * (1 - tf.eye(MAX_IN_PACK, num_columns=MAX_PICKED, dtype=self.float_type)), training=training)
+            pick_synergies = pick_synergies * (1 - tf.eye(MAX_IN_PACK, num_columns=MAX_PICKED, dtype=self.float_type))
+            # pick_synergies = self.pick_synergy_dropout(pick_synergies, training=training)
             internal_synergies = tf.reduce_sum(tf.expand_dims(scaled_picked_embeds, 2)
                                                * tf.expand_dims(scaled_picked_embeds, 1), -1)
-            internal_synergies = self.internal_synergy_dropout(internal_synergies * (1 - tf.eye(MAX_PICKED, dtype=self.float_type)), training=training)
-            total_probs = tf.reduce_sum(prob_pickeds, 2, name='total_probs')
+            internal_synergies = internal_synergies * (1 - tf.eye(MAX_PICKED, dtype=self.float_type))
+            # internal_synergies = self.internal_synergy_dropout(internal_synergies, training=training)
+            total_probs = tf.reduce_sum(prob_pickeds, 2, name='total_probs') # x255
 
         synergies = tf.reshape(tf.concat([internal_synergies, pick_synergies], 1), (-1,))
         synergies = tf.boolean_mask(synergies, tf.math.abs(synergies) > 0)
         tf.summary.histogram('values/synergies', synergies)
 
         with tf.xla.experimental.jit_scope(compile_ops=not self.debugging, separate_compiled_gradients=self.separate_gradients):
-            rating_scores = prob_in_packs * tf.expand_dims(in_pack_ratings, 1)
-            pick_synergy_scores = tf.math.divide_no_nan(
+            rating_scores = prob_in_packs * tf.expand_dims(in_pack_ratings, 1) # x255
+            pick_synergy_scores = tf.math.divide_no_nan( # x255
                 prob_in_packs * tf.reduce_sum(tf.expand_dims(prob_pickeds, 2)
                                               * tf.expand_dims(pick_synergies, 1), 3),
-                tf.expand_dims(picked_counts, -1)        # Same as for internal_synergy_oracles
+                255 * tf.expand_dims(picked_counts, -1) # Same as for internal_synergy_oracles
             )
             internal_synergy_scores = tf.expand_dims(tf.math.divide_no_nan(tf.reduce_sum(
                     (tf.expand_dims(prob_pickeds, 3) * tf.expand_dims(prob_pickeds, 2))
@@ -119,10 +119,12 @@ class DraftBot(tf.keras.models.Model):
                 total_probs * (picked_counts - 1)
             ), 2)
             colors_scores = tf.expand_dims(
-                tf.math.divide_no_nan(tf.reduce_sum(tf.expand_dims(picked_ratings, 1) * prob_pickeds, 2), picked_counts), 2
+                tf.math.divide_no_nan(tf.reduce_sum(tf.expand_dims(picked_ratings, 1) * prob_pickeds, 2), picked_counts),
+                2
             )
             openness_scores = tf.expand_dims(
-                tf.math.divide_no_nan(tf.reduce_sum(tf.expand_dims(seen_ratings, 1) * prob_seens, 2), seen_counts), 2
+                tf.reduce_sum(tf.expand_dims(seen_ratings, 1) * prob_seens, 2) / seen_counts,
+                2
             )
 
             oracles_weights = tf.reshape(tf.reduce_sum(
@@ -133,22 +135,12 @@ class DraftBot(tf.keras.models.Model):
                                                           internal_synergy_scores, colors_scores,
                                                           openness_scores)),
                                      axis=3, name='oracle_scores')
-            # We can multiply by 100 here instead of scaling the weights, ratings, and synergies earlier.
-            # We do want to scale them into the [0, 10] range though since that gives much nicer looking scores.
             scores = tf.reduce_sum(oracle_scores * oracles_weights, -1, name='weighted_scores')
-            max_scores = tf.reduce_logsumexp(tf.cast(self.temperature * scores, dtype=tf.float32), 1, name='max_scores')
+            max_scores = tf.reduce_logsumexp(tf.cast(self.temperature * scores, dtype=tf.float32), 1, name='max_scores') / 255
             # tf.summary.histogram('outputs/max_scores', max_scores / self.temperature)
             # tf.summary.histogram('outputs/true_max_scores', tf.reduce_max(max_scores, axis=1) / self.temperature)
             # tf.summary.histogram('outputs/correct_max_scores', max_scores[:,0] / self.temperature)
             choice_probs = tf.nn.softmax(max_scores, 1, name='choice_probs')
             tf.summary.histogram('outputs/prob_correct', choice_probs[:,0])
             tf.summary.histogram('outputs/probs_incorrect', choice_probs[:,1:])
-            # max_of_other = tf.reduce_logsumexp(self.temperature * max_scores[:,1:], 1) / self.temperature
-            return choice_probs
-            # return tf.cast(choice_probs, dtype=self.float_type)
-            # return (
-            #     choice_probs,
-            #     prob_correct,
-            #     # prob_correct
-            #     # (max_scores[:,0] - max_of_other) / max_scores[:,0]
-            # )
+            return tf.cast(choice_probs, dtype=self.float_type)
