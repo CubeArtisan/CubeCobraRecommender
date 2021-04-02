@@ -29,7 +29,7 @@ tf.config.optimizer.set_experimental_options=({
 
 def get_flops(concrete_func):
     from tensorflow.python.framework.convert_to_constants import convert_variables_to_constants_v2_as_graph
-    
+
     frozen_func, graph_def = convert_variables_to_constants_v2_as_graph(concrete_func)
 
     with tf.Graph().as_default() as graph:
@@ -40,11 +40,10 @@ def get_flops(concrete_func):
         flops = tf.compat.v1.profiler.profile(graph=graph, run_meta=run_meta, cmd="op", options=opts)
 
         return flops.total_float_ops
-        
 
-draftbot = DraftBot(np.zeros((21714,), dtype=np.float32), np.zeros((21714,64), dtype=np.float32), 1, 0.5, 0.5)
+draftbot = DraftBot(np.zeros((21468,), dtype=np.float32), np.zeros((21468,64), dtype=np.float32), 1, 0.5, 0.5, tf.float32, False)
 
-concrete = tf.function(lambda inputs: draftbot(inputs))
+concrete = tf.function(lambda inputs: draftbot((0, inputs)))
 concrete_func = concrete.get_concrete_function(
     [tf.TensorSpec([int(sys.argv[1]), *shape], dtype=dtype) for dtype, shape, _ in FEATURES]
 )

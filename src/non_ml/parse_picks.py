@@ -2,35 +2,46 @@ import glob
 import heapq
 import json
 import logging
-import multiprocessing
 import sys
 from collections import Counter
 from pathlib import Path
 
-logger = multiprocessing.get_logger()
+logger = logging.getLogger('parse_picks')
 
 import numpy as np
 
-MAX_IN_PACK = 32
-MAX_SEEN = 512 # Almost enough for 4x16 packs (544)
-MAX_PICKED = 64
-NUM_LAND_COMBS = 8
+MAX_IN_PACK = 24
+MAX_SEEN = 408 # Enough for 3x16 packs
+MAX_PICKED = 48
+NUM_LAND_COMBS = 16
 FEATURES = (
-    (np.uint16, (MAX_IN_PACK,), 'in_packs'), # int32 since you can't index with smaller or unsigned
-    (np.uint16, (MAX_SEEN,), 'seens'), # int32 same as for in_packs
-    (np.uint16, (), 'seen_counts'), # float16
-    (np.uint16, (MAX_PICKED,), 'pickeds'), # int32 same as for in_packs
-    (np.uint8, (), 'picked_counts'), # float16
+    (np.int32, (MAX_IN_PACK,), 'in_packs'), # int32 since you can't index with smaller or unsigned
+    (np.int32, (MAX_SEEN,), 'seens'), # int32 same as for in_packs
+    (np.float16, (), 'seen_counts'), # float16
+    (np.int32, (MAX_PICKED,), 'pickeds'), # int32 same as for in_packs
+    (np.float16, (), 'picked_counts'), # float16
     (np.int32, (4, 2), 'coords'),
-    (np.float32, (4,), 'coord_weights'), # TODO float16 and mult by 256 (we don't need to represent 1)
-    (np.uint8, (NUM_LAND_COMBS, MAX_SEEN), 'prob_seens'), # float16
-    (np.uint8, (NUM_LAND_COMBS, MAX_PICKED), 'prob_pickeds'), # float16
-    (np.uint8, (NUM_LAND_COMBS, MAX_IN_PACK), 'prob_in_packs'), # float16
+    (np.float16, (4,), 'coord_weights'),
+    (np.float16, (NUM_LAND_COMBS, MAX_SEEN), 'prob_seens'), # float16
+    (np.float16, (NUM_LAND_COMBS, MAX_PICKED), 'prob_pickeds'), # float16
+    (np.float16, (NUM_LAND_COMBS, MAX_IN_PACK), 'prob_in_packs'), # float16
+)
+RAGGED_FEATURES = (
+    (np.int32, (None,), 'in_packs'), # int32 since you can't index with smaller or unsigned
+    (np.int32, (None,), 'seens'), # int32 same as for in_packs
+    (np.int32, (None,), 'pickeds'), # int32 same as for in_packs
+    (np.float16, (), 'picked_counts'), # float16
+    (np.int32, (4, 2), 'coords'),
+    (np.float16, (4,), 'coord_weights'),
+    (np.float16, (None, NUM_LAND_COMBS), 'prob_seens'), # float16
+    (np.float16, (None, NUM_LAND_COMBS), 'prob_pickeds'), # float16
+    (np.float16, (None, NUM_LAND_COMBS), 'prob_in_packs'), # float16
 )
 COMPRESSION = None
 NUM_TRAIN_PICKS = 4096000
-NUM_TRAIN_SHARDS = 512
-NUM_TEST_SHARDS = 64
+NUM_TRAIN_SHARDS = 256
+NUM_TEST_SHARDS = 32
+pick_cache_dir = Path('data/parsed_picks/')
 FETCH_LANDS = {
     "arid mesa": ['r', 'w'],
     "bad river": ['u', 'b'],
@@ -143,7 +154,7 @@ def load_card_data():
                         costs_list.append(sub_cost)
                     devotions.append((costs[sub_cost], *sub_cost))
                 devotion_costs = (0, tuple(sorted(devotions)))
-            
+
             if devotion_costs not in costs:
                 costs[devotion_costs] = len(costs_list)
                 costs_list.append(devotion_costs)
@@ -164,7 +175,7 @@ def load_prob_table():
                 for str_land_count_a, nested4 in nested3.items():
                     for str_land_count_b, nested5 in nested4.items():
                         for str_land_count_ab, prob in nested5.items():
-                            prob_table[int(str_cmc)][int(str_required_a)][int(str_required_b)][int(str_land_count_a)][int(str_land_count_b)][int(str_land_count_ab)] = prob * 255
+                            prob_table[int(str_cmc)][int(str_required_a)][int(str_required_b)][int(str_land_count_a)][int(str_land_count_b)][int(str_land_count_ab)] = prob
     prob_table_json = None
     logger.info("Populated prob_table")
     return prob_table
@@ -189,8 +200,8 @@ def prob_to_cast_2(devotions, cmc, lands, lands_set, prob_table, prob_cache, lan
 
 
 def prob_to_cast_many(devotions, cmc, lands, lands_set, prob_table, prob_cache, lands_index, lands_list):
-    return np.prod([prob_to_cast(ci, prob_cache, prob_to_cast_1, devotion, cmc, lands_index, prob_table, lands_list) / 255
-                    for ci, cmc, devotion in devotions]) * 255
+    return np.prod([prob_to_cast(ci, prob_cache, prob_to_cast_1, devotion, cmc, lands_index, prob_table, lands_list)
+                    for ci, cmc, devotion in devotions])
 
 PROB_TO_CAST_BY_COUNT = (None, prob_to_cast_1, None, prob_to_cast_2, prob_to_cast_many, prob_to_cast_many, prob_to_cast_many)
 
@@ -293,7 +304,7 @@ def generate_probs(picked, seen, in_pack, costs_list, card_devotions, card_color
                         break
                 if next_best > prev_best:
                     break
-    return [np.uint8(tuple(arr)) for arr in zip(*[e[4] for e in heap])]
+    return [tuple(arr) for arr in zip(*[e[4] for e in heap])]
 
 
 def to_one_hot(item, num_items):
@@ -358,7 +369,7 @@ def parse_picks(pool, costs_list, card_devotions, card_colors, prob_table, num_c
                 loading_data.wait()
                 loaded_data = loading_data.get()
             loading_data = pool.starmap_async(load_pick, [(p, costs_list, card_devotions, card_colors, prob_table, num_climbs)
-                                                         for p in draft_entry['picks']], 15)
+                                                          for p in draft_entry['picks']], 15)
             in_file += len(draft_entry['picks'])
             for loaded_pick in loaded_data:
                 if loaded_pick is not None:
@@ -386,53 +397,148 @@ def picks_dataset(num_climbs=NUM_LAND_COMBS, proc_pool=None, num_workers=None, t
                                                     output_signature=tuple(tf.TensorSpec(shape=shape, dtype=dtype) for dtype, shape, _ in FEATURES)
         ).prefetch(tf.data.AUTOTUNE),
         cycle_length=num_workers, num_parallel_calls=tf.data.AUTOTUNE
-    ).shuffle(2**15).enumerate().prefetch(tf.data.AUTOTUNE)
+    ).shuffle(2**17).enumerate().prefetch(tf.data.AUTOTUNE)
 
-def load_picks(cache_dir, batch_size, num_workers=128):
+def load_picks(cache_type, batch_size, compressed=False, num_workers=128, ragged=False, pad=False):
     import tensorflow as tf
-    default_target = np.float64([1] + [0 for _ in range(MAX_IN_PACK - 1)])
-    default_true = np.float64(1)
-    return tf.data.experimental.load(
-        str(cache_dir),
-        ((tf.TensorSpec(shape=(), dtype=tf.int64), tf.TensorSpec(shape=(), dtype=tf.int64)), tuple(tf.TensorSpec(shape=shape, dtype=dtype) for dtype, shape, _ in FEATURES)),
-        compression=COMPRESSION,
-        reader_func=lambda ds: ds.shuffle(NUM_TRAIN_SHARDS).interleave(lambda x: x, cycle_length=num_workers, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
-    ).shuffle(16 * batch_size).map(lambda _, y: y).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    compression = 'GZIP' if compressed else None
+    if ragged:
+        directory = pick_cache_dir / f'{cache_type}_ragged'
+        if compressed:
+            directory = pick_cache_dir / f'{cache_type}_ragged_compressed'
+        result = tf.data.experimental.load(
+            str(directory),
+            (
+                tf.TensorSpec(shape=(), dtype=tf.int64, name=None),
+                (
+                    (
+                        tf.TensorSpec(shape=(None), dtype=tf.int32),
+                        tf.TensorSpec(shape=(None), dtype=tf.int32),
+                        tf.TensorSpec(shape=(None), dtype=tf.int32),
+                        tf.TensorSpec(shape=(4, 2), dtype=tf.int32),
+                        tf.TensorSpec(shape=(4,), dtype=tf.float16),
+                        tf.TensorSpec(shape=(None, 16), dtype=tf.float16),
+                        tf.TensorSpec(shape=(None, 16), dtype=tf.float16),
+                        tf.TensorSpec(shape=(None, 16), dtype=tf.float16),
+                    ),
+                    tf.TensorSpec(shape=(None,), dtype=tf.float64)
+                )
+            ),
+            compression=compression,
+            reader_func=lambda ds:
+                ds.shuffle(NUM_TRAIN_SHARDS + NUM_TEST_SHARDS)
+                  .interleave(lambda x: x,
+                              cycle_length=num_workers, num_parallel_calls=num_workers)
+        ).shuffle(batch_size * 8).map(lambda _, inputs: inputs, num_parallel_calls=num_workers)
+        if pad:
+            return result.map(lambda features, target: (
+                (
+                    tf.pad(features[0], [[0, MAX_IN_PACK - len(features[0])]]),
+                    tf.pad(features[1], [[0, MAX_SEEN - len(features[1])]]),
+                    len(features[1]),
+                    tf.pad(features[2], [[0, MAX_PICKED - len(features[2])]]),
+                    len(features[2]),
+                    features[3],
+                    features[4],
+                    tf.pad(features[5], [[0, MAX_SEEN - len(features[5])], [0, 0]]),
+                    tf.pad(features[6], [[0, MAX_PICKED - len(features[6])], [0, 0]]),
+                    tf.pad(features[7], [[0, MAX_IN_PACK - len(features[7])], [0, 0]]),
+                ),
+                tf.pad(target, [[0, MAX_IN_PACK - len(target)]]),
+            ), num_parallel_calls=num_workers).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        else:
+            return result.apply(tf.data.experimental.dense_to_ragged_batch(batch_size)).map(lambda *args: (args[:8], args[8])).prefetch(tf.data.AUTOTUNE)
+    else:
+        default_target = np.float64([1] + [0 for _ in range(MAX_IN_PACK - 1)])
+        default_true = np.float64(1)
+        directory = pick_cache_dir / cache_type
+        if compressed:
+            directory = pick_cache_dir / f'{cache_type}_compressed'
+        return tf.data.experimental.load(
+            str(directory),
+            (tf.TensorSpec(shape=(), dtype=tf.int64), tuple(tf.TensorSpec(shape=shape, dtype=dtype) for dtype, shape, _ in FEATURES)),
+            compression=compression,
+            reader_func=lambda ds:
+                ds.shuffle(NUM_TRAIN_SHARDS)
+                  .interleave(lambda x: x,
+                              cycle_length=num_workers, num_parallel_calls=num_workers)
+        ).shuffle(batch_size * 8)\
+         .map(lambda _, inputs: (inputs, default_target), num_parallel_calls=num_workers)\
+         .batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
+def features_to_ragged(in_pack_card_indices, seen_indices, seen_counts,
+                       picked_card_indices, picked_counts, coords, coord_weights,
+                       prob_seen_matrices, prob_picked_matrices, prob_in_pack_matrices):
+    in_pack_mask = in_pack_card_indices > 0
+    in_pack_card_indices = tf.boolean_mask(in_pack_card_indices, in_pack_mask)
+    prob_in_pack_matrices = tf.boolean_mask(tf.transpose(prob_in_pack_matrices, [1, 0]), in_pack_mask)
+    target = tf.boolean_mask(np.float64([1] + [0 for _ in range(MAX_IN_PACK - 1)]), in_pack_mask)
+    seen_mask = seen_indices > 0
+    seen_indices = tf.boolean_mask(seen_indices, seen_mask)
+    prob_seen_matrices = tf.boolean_mask(tf.transpose(prob_seen_matrices, [1, 0]), seen_mask)
+    picked_mask = picked_card_indices > 0
+    picked_card_indices = tf.boolean_mask(picked_card_indices, picked_mask)
+    prob_picked_matrices = tf.boolean_mask(tf.transpose(prob_picked_matrices, [1, 0]), picked_mask)
+    return (
+        (
+            in_pack_card_indices, seen_indices, picked_card_indices, coords, coord_weights,
+            prob_seen_matrices, prob_picked_matrices, prob_in_pack_matrices
+        ),
+        target,
+    )
+    
 if __name__ == '__main__':
+    import multiprocessing
+    import tensorflow as tf
+    logger = multiprocessing.get_logger()
+    full_cache_dir = pick_cache_dir / 'full_compressed'
     formatter = logging.Formatter('{asctime} [{levelname}] {message}', style='{')
     handler = logging.StreamHandler()
     handler.setFormatter(formatter)
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
     num_workers = int(sys.argv[1])
+
     with multiprocessing.Pool(num_workers) as proc_pool:
-        pick_cache_dir = Path('data/parsed_picks/')
-        import tensorflow as tf
         full_dataset = picks_dataset(proc_pool=proc_pool, num_workers=num_workers, tf=tf)
+        tf.data.experimental.save(full_dataset, str(pick_cache_dir / 'full'),
+                                  compression=None, shard_func=lambda x, _: x % (NUM_TRAIN_SHARDS + NUM_TEST_SHARDS))
 
-        full_cache_dir = pick_cache_dir / 'compressed_full'
-        full_cache_dir.mkdir(exist_ok=True, parents=True)
-        tf.data.experimental.save(full_dataset, str(full_cache_dir),
-                                  compression='GZIP',
-                                  shard_func=lambda x, _: x % NUM_TRAIN_SHARDS)
-
-        full_dataset = tf.data.experimental.load(
-            str(full_cache_dir),
-            (tf.TensorSpec(shape=(), dtype=tf.int64), tuple(tf.TensorSpec(shape=shape, dtype=dtype) for dtype, shape, _ in FEATURES)),
-            compression='GZIP',
-        ).map(lambda _, y: y).enumerate().prefetch(tf.data.AUTOTUNE)
-
-        train_cache_dir = pick_cache_dir / 'train'
-        train_cache_dir.mkdir(exist_ok=True)
-        train_dataset = full_dataset.take(NUM_TRAIN_PICKS)
-        tf.data.experimental.save(train_dataset, str(train_cache_dir),
-                                  compression=COMPRESSION,
-                                  shard_func=lambda x, _: x % NUM_TRAIN_SHARDS)
-
-        test_cache_dir = pick_cache_dir / 'test'
-        test_cache_dir.mkdir(exist_ok=True)
-        test_dataset = full_dataset.skip(NUM_TRAIN_PICKS)
-        tf.data.experimental.save(test_dataset, str(test_cache_dir),
-                                  compression=COMPRESSION,
-                                  shard_func=lambda x, _: x % NUM_TEST_SHARDS)
+    full_dataset = tf.data.experimental.load(
+        str(pick_cache_dir / 'full'),
+        (tf.TensorSpec(shape=(), dtype=tf.int64), tuple(tf.TensorSpec(shape=shape, dtype=dtype) for dtype, shape, _ in FEATURES)),
+        compression=None,
+        reader_func=lambda ds: ds.interleave(lambda x: x, deterministic=True)
+    )
+    full_ragged_dataset = full_dataset.map(lambda i, y: (i, features_to_ragged(*y)))    
+    full_ragged_element_type = full_ragged_dataset.element_spec
+    test_dataset = full_dataset.skip(NUM_TRAIN_PICKS).prefetch(tf.data.AUTOTUNE)
+    train_dataset = full_dataset.take(NUM_TRAIN_PICKS).prefetch(tf.data.AUTOTUNE)
+    test_ragged_dataset = full_ragged_dataset.skip(NUM_TRAIN_PICKS).prefetch(tf.data.AUTOTUNE)
+    train_ragged_dataset = full_ragged_dataset.take(NUM_TRAIN_PICKS).prefetch(tf.data.AUTOTUNE)
+    
+    tf.data.experimental.save(full_dataset.prefetch(tf.data.AUTOTUNE), str(pick_cache_dir / 'full'),
+                              compression=None, shard_func=lambda x, _: x % (NUM_TRAIN_SHARDS + NUM_TEST_SHARDS))
+    tf.data.experimental.save(full_dataset.prefetch(tf.data.AUTOTUNE), str(pick_cache_dir / 'full_compressed'),
+                              compression='GZIP', shard_func=lambda x, _: x % ((NUM_TRAIN_SHARDS + NUM_TEST_SHARDS) // 4) )
+    tf.data.experimental.save(full_ragged_dataset.prefetch(tf.data.AUTOTUNE), str(pick_cache_dir / 'full_ragged'),
+                              compression=None, shard_func=lambda x, _: x % ((NUM_TRAIN_SHARDS + NUM_TEST_SHARDS) // 2))
+    tf.data.experimental.save(full_ragged_dataset.prefetch(tf.data.AUTOTUNE), str(pick_cache_dir / 'full_ragged_compressed'),
+                              compression='GZIP', shard_func=lambda x, _: x % ((NUM_TRAIN_SHARDS + NUM_TEST_SHARDS) // 8))
+    tf.data.experimental.save(train_dataset, str(pick_cache_dir / 'train'),
+                              compression=None, shard_func=lambda x, _: x % NUM_TRAIN_SHARDS)
+    tf.data.experimental.save(train_dataset, str(pick_cache_dir / 'train_compressed'),
+                              compression='GZIP', shard_func=lambda x, _: x % (NUM_TRAIN_SHARDS // 4))
+    tf.data.experimental.save(train_ragged_dataset, str(pick_cache_dir / 'train_ragged'),
+                              compression=None, shard_func=lambda x, _: x % (NUM_TRAIN_SHARDS // 2))
+    tf.data.experimental.save(train_ragged_dataset, str(pick_cache_dir / 'train_ragged_compressed'),
+                              compression='GZIP', shard_func=lambda x, _: x % (NUM_TRAIN_SHARDS // 8))
+    tf.data.experimental.save(test_dataset, str(pick_cache_dir / 'test'),
+                              compression=None, shard_func=lambda x, _: x % NUM_TEST_SHARDS) 
+    tf.data.experimental.save(test_dataset, str(pick_cache_dir / 'test_compressed'),
+                              compression='GZIP', shard_func=lambda x, _: x % (NUM_TEST_SHARDS // 4))
+    tf.data.experimental.save(test_ragged_dataset, str(pick_cache_dir / 'test_ragged'),
+                              compression=None, shard_func=lambda x, _: x % (NUM_TEST_SHARDS // 2)) 
+    tf.data.experimental.save(test_ragged_dataset, str(pick_cache_dir / 'test_ragged_compressed'),
+                              compression='GZIP', shard_func=lambda x, _: x % (NUM_TEST_SHARDS // 8))
+    
