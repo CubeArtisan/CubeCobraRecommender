@@ -46,6 +46,7 @@ def get_ml_recommend(model, int_to_card, card_to_int, cube_name, amount, root=RO
     for rec in ranked:
         if cube[0][rec] != 1:
             card = int_to_card[rec]
+            if card == 'invalid card': continue
             if non_json:
                 print(card)
             else:
@@ -56,6 +57,7 @@ def get_ml_recommend(model, int_to_card, card_to_int, cube_name, amount, root=RO
 
     for idx in cube_indices:
         card = int_to_card[idx]
+        if card == 'invalid card': continue
         output["cuts"][card] = results[idx].item()
     print('Output:', output)
     if not non_json:
