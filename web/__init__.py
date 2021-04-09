@@ -55,4 +55,5 @@ if __name__ == "__main__":
     card_to_int = {v: k for k, v in int_to_card.items()}
 
     model = keras.models.load_model(model_path)
+    print('Model:', model)
     app.run(host="0.0.0.0", port=8000, threaded=True)

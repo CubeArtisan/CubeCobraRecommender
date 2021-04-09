@@ -33,8 +33,10 @@ def get_ml_recommend(model, int_to_card, card_to_int, cube_name, amount, root=RO
         encoded = model.encoder(data)
         return model.decoder(encoded)
 
+    print('Preparing to fetch recommendations')
     cube = np.array(cube, dtype=float).reshape(1, num_cards)
     results = recommend(model, cube)[0].numpy()
+    print('Got results,', results)
 
     ranked = results.argsort()[::-1]
 
