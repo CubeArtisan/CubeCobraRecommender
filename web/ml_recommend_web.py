@@ -57,6 +57,6 @@ def get_ml_recommend(model, int_to_card, card_to_int, cube_name, amount, root=RO
     for idx in cube_indices:
         card = int_to_card[idx]
         output["cuts"][card] = results[idx].item()
-
+    print('Output:', output)
     if not non_json:
         return output

@@ -37,7 +37,8 @@ def api():
         results = get_ml_recommend(model, int_to_card, card_to_int, cube_name, num_recs, root)
     except Exception as e:
         app.logger.error(e)
-        raise e
+        raise
+    print('Results to client.', results)
     return jsonify(results)
 
 @app.route("/embeddings/",methods=['POST'])
