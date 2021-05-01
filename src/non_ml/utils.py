@@ -2,7 +2,7 @@ import json
 import os
 
 import numpy as np
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 BAD_NAMES = [
     'plains',
@@ -153,7 +153,7 @@ def build_mtx(deck_folder, num_cards,
               soft_validation=0):
     adj_mtx = np.zeros((num_cards, num_cards), dtype=np.uint32)
     counter = 0
-    for filename in tqdm(deck_folder.iterdir(), unit='file', dynamic_ncols=True):
+    for filename in tqdm(list(deck_folder.iterdir()), unit='file', dynamic_ncols=True):
         with open(filename, 'rb') as deck_file:
             contents = json.load(deck_file)
         for deck in tqdm(contents, unit='deck', unit_scale=True, dynamic_ncols=True, initial=counter, leave=None):

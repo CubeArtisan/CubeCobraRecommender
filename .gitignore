@@ -12,4 +12,6 @@ cubecobra_recommender_generator.egg-info/
 dist/
 ml_files/
 compile_commands.json
-.python_version
+.python-version
+.cache/
+
