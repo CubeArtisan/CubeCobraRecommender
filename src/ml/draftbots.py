@@ -9,7 +9,7 @@ def get_mask(tensor):
     return tensor._keras_mask
 
 def mask_to_zeros(tensor):
-    result = tf.where(get_mask(tensor), tensor, tf.zeros_like(tensor))
+    result = tensor * tf.cast(get_mask(tensor), dtype=tensor.dtype)
     result._keras_mask = get_mask(tensor)
     return result
     
@@ -76,7 +76,6 @@ class CardSynergy(tf.keras.models.Model):
         x_range = tf.stop_gradient(tf.math.reduce_max(x) - tf.math.reduce_min(x))
         x_stddev = tf.math.reduce_std(tf.clip_by_value(x, -5, 5))
         x_abs = tf.math.abs(x)
-        x_max_abs = tf.stop_gradient(tf.math.maximum(tf.math.reduce_max(x_abs), 2))
         loss_for_layer = tf.math.reduce_mean(tf.math.pow(tf.math.maximum(x_abs - 2, 0), 4) + tf.math.pow((x_abs + 1e-04), 1)) / (1 * (1 + 5 * tf.math.minimum(x_stddev, 1 / 5)))
         print(loss_for_layer.shape, loss_for_layer)
         with tf.xla.experimental.jit_scope(compile_ops=False):
@@ -134,7 +133,7 @@ class DraftBot(tf.keras.models.Model):
         with tf.xla.experimental.jit_scope(compile_ops=self.use_xla, separate_compiled_gradients=self.separate_gradients):
             if self.ragged:
                 in_pack_cards, seen_cards, picked_cards, coords, coord_weights,\
-                prob_seens, prob_pickeds, prob_in_packs = inputs
+                prob_seens, prob_pickeds, prob_in_packs = inputs[1]
                 picked_counts = tf.math.reduce_sum(tf.ones_like(picked_cards, dtype=self.float_type), 1)
                 seen_counts = tf.math.reduce_sum(tf.ones_like(seen_carsd, dtype=self.float_type), 1)
                 picked_cards = tf.expand_dims(picked_cards, 2)
@@ -155,9 +154,12 @@ class DraftBot(tf.keras.models.Model):
             prob_in_packs = tf.cast(prob_in_packs, dtype=self.float_type, name='prob_in_packs')
             
             min_rating = tf.stop_gradient(tf.math.reduce_min(self.ratings[1:]))
-            max_rating = tf.stop_gradient(tf.math.reduce_max(self.ratings[1:]))
+            # max_rating = tf.stop_gradient(tf.math.reduce_max(self.ratings[1:]))
+            #min_rating = -tf.math.reduce_logsumexp(-self.ratings[1:])
+            max_rating = tf.math.reduce_logsumexp(self.ratings[1:])
             rating_range = max_rating - min_rating
             oracle_weights = tf.cast(self.oracle_weights - tf.stop_gradient(tf.reduce_min(self.oracle_weights)), dtype=self.float_type) + 1e-04
+            # oracle_weights = tf.cast(self.oracle_weights + tf.reduce_logsumexp(-self.oracle_weights), dtype=self.float_type) + 1e-02
             oracle_weights_orig = oracle_weights / tf.reduce_sum(oracle_weights, axis=2, keepdims=True)
 
             oracle_weight_values = tf.gather_nd(oracle_weights_orig, coords, name='oracle_weight_values') # (-1, 4, 5)
@@ -196,18 +198,18 @@ class DraftBot(tf.keras.models.Model):
                 # internal_synergies_dense = internal_synergies_dense * (1 - tf.eye(MAX_PICKED))
                 # internal_synergies = tf.ragged.boolean_mask(internal_synergies_dense, tf.cast(tf.ones_like(internal_synergies).to_tensor(internal_synergies_dense.shape), dtype=tf.bool))
             # else:
-                # eye = 1 - tf.eye(MAX_PICKED)
-                # mask = tf.logical_and(get_mask(internal_synergies), tf.cast(eye, dtype=tf.bool))
-                # internal_synergies = internal_synergies * eye
-                # internal_synergies._keras_mask = mask
-            total_probs = tf.reduce_sum(prob_pickeds, 1, name='total_probs')
+            eye = 1 - tf.eye(MAX_PICKED)
+            mask = tf.logical_and(get_mask(internal_synergies), tf.cast(eye, dtype=tf.bool))
+            internal_synergies = internal_synergies * eye
+            internal_synergies._keras_mask = mask
+            total_probs = tf.reduce_sum(prob_pickeds, 2, name='total_probs')
             oracle_weights = tf.einsum('bxo,bx->bo', oracle_weight_values, coord_weights, name='oracle_weights')
             rating_weights, pick_synergy_weights, internal_synergy_weights,\
                 colors_weights, openness_weights = tf.unstack(oracle_weights, num=5, axis=1)
 
-            rating_scores = tf.einsum('bcl,bc,b->bcl', prob_in_packs, in_pack_ratings, rating_weights, name='rating_scores')
+            rating_scores = tf.einsum('blc,bc,b->bcl', prob_in_packs, in_pack_ratings, rating_weights, name='rating_scores')
             pick_synergy_scores = tf.einsum(
-                'bcp,bpl,bcl,b,b->bcl',
+                'bcp,blp,blc,b,b->bcl',
                 pick_synergies,
                 prob_pickeds, prob_in_packs,
                 1 / tf.math.maximum(picked_counts, 1),
@@ -215,7 +217,7 @@ class DraftBot(tf.keras.models.Model):
                 name='pick_synergies_scores'
             )
             internal_synergy_scores = tf.einsum(
-                'bcp,bpl,bcl,bl,b,b->bl',
+                'bcp,blp,blc,bl,b,b->bl',
                 internal_synergies,
                 prob_pickeds, prob_pickeds,
                 1 / tf.math.maximum(total_probs, 1),
@@ -224,14 +226,14 @@ class DraftBot(tf.keras.models.Model):
                 name='internal_synergies_scores'
             )
             colors_scores = tf.einsum(
-                'bpl,bp,b,b->bl',
+                'blp,bp,b,b->bl',
                 prob_pickeds, picked_ratings,
                 1 / tf.math.maximum(picked_counts, 1),
                 colors_weights,
                 name='colors_scores'
             )
             openness_scores = tf.einsum(
-                'bsl,bs,b,b->bl',
+                'bls,bs,b,b->bl',
                 prob_seens, seen_ratings,
                 1 / tf.math.maximum(seen_counts, 1),
                 openness_weights,
@@ -240,36 +242,41 @@ class DraftBot(tf.keras.models.Model):
 
             scores = self.temperature * tf.cast(rating_scores + pick_synergy_scores
                                                 + tf.expand_dims(internal_synergy_scores + colors_scores + openness_scores, 1), dtype=tf.float64)
-            min_scores = tf.math.reduce_min(scores, 2, keepdims=True)
+            #min_scores = tf.math.reduce_min(scores, 2, keepdims=True)
+            max_scores = tf.stop_gradient(tf.reduce_max(scores, 2, keepdims=True))
             # scores = tf.ragged.boolean_mask(scores, in_pack_cards > 0)
             # min_scores = tf.ragged.boolean_mask(min_scores, in_pack_cards > 0)
-            lse_scores = tf.math.reduce_sum(tf.math.exp(scores - min_scores + 1e-04) - 1, 2, name='lse_exp_scores')
-            choice_probs = lse_scores / tf.math.maximum(tf.math.reduce_sum(lse_scores, 1, keepdims=True), lse_scores + 1e-04)
+            lse_scores = tf.math.reduce_sum(tf.math.exp(scores - max_scores) * tf.expand_dims(tf.cast(in_pack_cards > 0, dtype=scores.dtype), -1),
+                                            2, name='lse_exp_scores')
+            choice_probs = lse_scores / tf.math.reduce_sum(lse_scores, 1, keepdims=True)
             tensor_probs = choice_probs
             # tensor_probs = choice_probs.to_tensor(shape=(None, MAX_IN_PACK))
         with tf.xla.experimental.jit_scope(compile_ops=False):
-            if (tf.summary.experimental.get_step() % 12) == 0:
+            if (tf.summary.experimental.get_step() % 50) == 0:
                 # tf.summary.histogram('weights/oracle_weights', oracle_weights)
                 tf.summary.histogram('weights/card_ratings', (self.ratings - min_rating) / rating_range)
                 for i, name in enumerate(('ratings', 'pick_synergy', 'internal_synergy', 'colors', 'openness')):
                     log_timeseries(f'weights/{name}_weights', tf.gather(oracle_weights_orig, i, axis=2), start_index=1)
-                # filtered_internal = tf.boolean_mask(
-                    # tf.reshape(internal_synergies, (-1,)), 
-                    # tf.reshape(tf.not_equal(internal_synergies, 0), (-1,))
-                # )
-                filtered_pick = tf.boolean_mask(
-                    tf.reshape(pick_synergies, (-1,)),
-                    tf.reshape(tf.math.not_equal(pick_synergies, 0), (-1,)),
-                )
-                tf.summary.histogram('values/pick_synergies', filtered_pick)
-                # tf.summary.histogram('values/internal_synergies', filtered_internal)
-                # tf.summary.histogram('values/synergies', tf.concat([filtered_internal, filtered_pick], 0))
-                tf.summary.histogram('outputs/choice_probs', tf.boolean_mask(choice_probs, choice_probs > 0))#.flat_values)
+                
+                if (tf.summary.experimental.get_step() % 250) == 0:
+                    filtered_pick = tf.boolean_mask(
+                        tf.reshape(pick_synergies, (-1,)),
+                        tf.reshape(tf.math.not_equal(pick_synergies, 0), (-1,)),
+                    )
+                    # filtered_internal = tf.boolean_mask(
+                        # tf.reshape(internal_synergies, (-1,)), 
+                        # tf.reshape(tf.not_equal(internal_synergies, 0), (-1,))
+                    # )
+                    tf.summary.histogram('values/pick_synergies', filtered_pick)
+                    # tf.summary.histogram('values/internal_synergies', filtered_internal)
+                    # tf.summary.histogram('values/synergies', tf.concat([filtered_internal, filtered_pick], 0))
+                    tf.summary.histogram('outputs/scores', scores)#.flat_values)
+                    tf.summary.histogram('outputs/max_scores', tf.math.reduce_max(scores, 1))#.flat_values)
+                    tf.summary.histogram('outputs/score_differences', (tf.math.reduce_max(scores, 2) - tf.math.reduce_min(scores, 2)))#.flat_values)
+                    tf.summary.histogram('outputs/lse_scores', lse_scores)#.flat_values)
+                
+                # tf.summary.histogram('outputs/choice_probs', tf.boolean_mask(choice_probs, choice_probs > 0))#.flat_values)
                 tf.summary.histogram('outputs/prob_correct', tensor_probs[:,0])
                 tf.summary.histogram('outputs/probs_incorrect', tf.boolean_mask(choice_probs[:,1:], choice_probs[:,1:] > 0))
-                tf.summary.histogram('outputs/scores', scores)#.flat_values)
-                tf.summary.histogram('outputs/max_scores', tf.math.reduce_max(scores, 2))#.flat_values)
-                tf.summary.histogram('outputs/score_differences', (tf.math.reduce_max(scores, 2) - tf.math.reduce_min(scores, 2)))#.flat_values)
-                tf.summary.histogram('outputs/lse_scores', lse_scores)#.flat_values)
-                # tf.summary.histogram('outputs/correct_lse_scores', tf.math.log(lse_scores[:,0]))
+               # tf.summary.histogram('outputs/correct_lse_scores', tf.math.log(lse_scores[:,0]))
         return tensor_probs

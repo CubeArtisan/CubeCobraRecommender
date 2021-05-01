@@ -149,10 +149,10 @@ if __name__ == "__main__":
     projector.visualize_embeddings(log_dir, projector_config)
     
     print('Creating the pick Datasets.')
-    # full_dataset = load_picks('full', args.batch_size, num_workers=args.num_workers, compressed=args.compressed, ragged=args.ragged)
-    train_dataset = load_picks('train', args.batch_size, num_workers=args.num_workers, compressed=args.compressed, ragged=args.ragged, pad=True)
-    test_dataset = load_picks('test', args.batch_size, num_workers=args.num_workers, compressed=args.compressed, ragged=args.ragged, pad=True)
-    
+    # full_dataset = load_picks('full', args.batch_size, num_workers=32, compressed=args.compressed, ragged=args.ragged)
+    train_dataset = load_picks('train', args.batch_size, num_workers=32, compressed=args.compressed, ragged=args.ragged, pad=True)
+    test_dataset = load_picks('test', args.batch_size, num_workers=32, compressed=args.compressed, ragged=args.ragged, pad=True)
+    print(train_dataset.element_spec)
     print('Loading DraftBot model.')
     output_dir = f'././ml_files/{args.name}/'
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -207,24 +207,40 @@ if __name__ == "__main__":
                                                    mode='max', restore_best_weights=True, verbose=True)
     # callbacks.append(es_callback)
     lr_callback = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_categorical_accuracy', factor=0.5, mode='max',
-                                                       patience=12, min_delta=1/(2**12), cooldown=6, min_lr=1/(2**17),
+                                                       patience=8, min_delta=1/(2**13), cooldown=4, min_lr=1/(2**17),
                                                        verbose=True)
     callbacks.append(lr_callback)
-    print(train_dataset.cardinality())
+    print(train_dataset.cardinality().numpy() // 10, 'profile:', args.profile)
     tb_callback = TensorBoardFix(log_dir=log_dir, histogram_freq=1, write_graph=False,
-                                 update_freq=train_dataset.cardinality().numpy() // 10, embeddings_freq=1,
+                                 update_freq=train_dataset.cardinality().numpy() // 5, embeddings_freq=1,
                                  profile_batch=0 if args.debug or not args.profile
-                                                 else (train_dataset.cardinality().numpy() * 1.3 + 1,
-                                                       1.4 * train_dataset.cardinality().numpy() + 1))
+                                                 else (int(train_dataset.cardinality().numpy() * 1.56),
+                                                       int(1.64 * train_dataset.cardinality().numpy())))
     callbacks.append(tb_callback)
     hp_callback = hp.KerasCallback(log_dir, hparams)
     # callbacks.append(hp_callback)
     scale_factor = tf.cast(tf.math.pow(args.max_temperature / args.temperature, 1 / (args.epochs - 2)), dtype=tf.float64)
+    print('temperature:', args.temperature, 'max_temperature:', args.max_temperature, 'scale_factor:', scale_factor)
     temp_callback = tf.keras.callbacks.LambdaCallback(on_epoch_end=lambda epoch, logs: draftbots.temperature.assign(draftbots.temperature * scale_factor))
     callbacks.append(temp_callback)
+    default_target = np.zeros((args.batch_size, MAX_IN_PACK))
+    default_target[:,0] = 1
+    verify_target = np.zeros((test_dataset.cardinality().numpy(), args.batch_size, MAX_IN_PACK))
+    verify_target[:,:,0] = 1
+    default_target = tf.data.Dataset.from_tensors(tf.constant(default_target, dtype=tf.float64))
+    verify_target = tf.data.Dataset.from_tensor_slices(tf.constant(verify_target, dtype=tf.float64))
+    train_dataset_par = tf.data.Dataset.range(args.num_workers).interleave(lambda _: train_dataset, cycle_length=args.num_workers, num_parallel_calls=args.num_workers, deterministic=False)
+    print(train_dataset_par.element_spec)
     draftbots.fit(
-        train_dataset,
-        validation_data=test_dataset,
+        tf.data.Dataset.zip((
+            train_dataset_par.repeat(),
+            default_target.repeat()
+        )).prefetch(tf.data.AUTOTUNE),
+        steps_per_epoch=train_dataset.cardinality().numpy(),
+        validation_data=tf.data.Dataset.zip((
+            test_dataset,
+            verify_target,
+        )).prefetch(tf.data.AUTOTUNE),
         epochs=args.epochs,
         callbacks=callbacks,
     )

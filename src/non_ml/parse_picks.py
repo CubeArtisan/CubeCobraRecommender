@@ -429,28 +429,38 @@ def load_picks(cache_type, batch_size, compressed=False, num_workers=128, ragged
                 ds.shuffle(NUM_TRAIN_SHARDS + NUM_TEST_SHARDS)
                   .interleave(lambda x: x,
                               cycle_length=num_workers, num_parallel_calls=num_workers)
-        ).shuffle(batch_size * 8).map(lambda _, inputs: inputs, num_parallel_calls=num_workers)
+        ).shuffle(batch_size * 8)
         if pad:
-            return result.map(lambda features, target: (
-                (
-                    tf.pad(features[0], [[0, MAX_IN_PACK - len(features[0])]]),
-                    tf.pad(features[1], [[0, MAX_SEEN - len(features[1])]]),
-                    len(features[1]),
-                    tf.pad(features[2], [[0, MAX_PICKED - len(features[2])]]),
-                    len(features[2]),
-                    features[3],
-                    features[4],
-                    tf.pad(features[5], [[0, MAX_SEEN - len(features[5])], [0, 0]]),
-                    tf.pad(features[6], [[0, MAX_PICKED - len(features[6])], [0, 0]]),
-                    tf.pad(features[7], [[0, MAX_IN_PACK - len(features[7])], [0, 0]]),
-                ),
-                tf.pad(target, [[0, MAX_IN_PACK - len(target)]]),
-            ), num_parallel_calls=num_workers).batch(batch_size).prefetch(tf.data.AUTOTUNE)
+            return result.map(lambda _, x: ((
+                x[0][0],
+                x[0][1],
+                len(x[0][1]),
+                x[0][2],
+                len(x[0][2]),
+                x[0][3],
+                x[0][4],
+                x[0][5],
+                x[0][6],
+                x[0][7],
+            )), num_parallel_calls=num_workers).padded_batch(batch_size, (
+                (MAX_IN_PACK,),
+                (MAX_SEEN,),
+                (),
+                (MAX_PICKED,),
+                (),
+                (4, 2),
+                (4,),
+                (MAX_SEEN, NUM_LAND_COMBS),
+                (MAX_PICKED, NUM_LAND_COMBS),
+                (MAX_IN_PACK, NUM_LAND_COMBS),
+            ), drop_remainder=True).prefetch(tf.data.AUTOTUNE)
         else:
             return result.apply(tf.data.experimental.dense_to_ragged_batch(batch_size)).map(lambda *args: (args[:8], args[8])).prefetch(tf.data.AUTOTUNE)
     else:
-        default_target = np.float64([1] + [0 for _ in range(MAX_IN_PACK - 1)])
-        default_true = np.float64(1)
+        default_target = np.zeros((batch_size, MAX_IN_PACK))
+        default_target[:,0] = 1
+        default_target = tf.constant(default_target, dtype=tf.float64)
+        # default_target = np.float64([1] + [0 for _ in range(MAX_IN_PACK - 1)])
         directory = pick_cache_dir / cache_type
         if compressed:
             directory = pick_cache_dir / f'{cache_type}_compressed'
@@ -461,10 +471,10 @@ def load_picks(cache_type, batch_size, compressed=False, num_workers=128, ragged
             reader_func=lambda ds:
                 ds.shuffle(NUM_TRAIN_SHARDS)
                   .interleave(lambda x: x,
-                              cycle_length=num_workers, num_parallel_calls=num_workers)
+                              num_parallel_calls=tf.data.AUTOTUNE,
+                              deterministic=False)
         ).shuffle(batch_size * 8)\
-         .map(lambda _, inputs: (inputs, default_target), num_parallel_calls=num_workers)\
-         .batch(batch_size).prefetch(tf.data.AUTOTUNE)
+         .batch(batch_size)#.map(lambda _, inputs: (inputs, default_target), num_parallel_calls=num_workers)
 
 def features_to_ragged(in_pack_card_indices, seen_indices, seen_counts,
                        picked_card_indices, picked_counts, coords, coord_weights,
