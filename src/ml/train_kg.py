@@ -16,19 +16,27 @@ if __name__ == '__main__':
     import src.non_ml.utils as utils
     import tensorflow as tf
 
-    from src.ml.model import CC_Recommender
-    from src.generated.generator import GeneratorWithAdj
+    from src.ml.kgin import KGRecommender
+    from src.generated.generator import GeneratorWithoutAdj
 
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', '-e', type=int, help='The number of epochs to train for.')
     parser.add_argument('--batch-size', '-b', type=int, choices=[2**i for i in range(0, 16)], help='The number of cubes/cards to train on at a time.')
+    parser.add_argument('--layers', type=int, default=3, choices=list(range(9)), help='The number of message passing layers.')
+    parser.add_argument('--entity-dims', type=int, default=128, choices=[2**i for i in range(0, 12)], help='The number of dimensions for the node embeddings')
+    parser.add_argument('--normalize', type=int, default=None, choices=[1, 2], help='The kind of normalization to apply to the embeddings, L1 or L2 default is no normalization.')
+    parser.add_argument('--relation-dims', type=int, default=64, choices=[2**i for i in range(0, 10)], help='The number of dimensions for the relation specific views of the node embeddings.')
+    parser.add_argument('--initializer', type=str, default='glorot_uniform', help='The initializer for the model weights, value can be any supported by keras.')
+    parser.add_argument('--relation-activation', type=str, default='linear', help='The activation function for mapping to the relation views of nodes. Value can be any supported by keras.')
+    parser.add_argument('--message-dropout', type=float, default=0.2, help='The number of edges that get skipped for message passing in each layer, only applies for training.')
+    parser.add_argument('--intents', type=int, default=4, choices=[2**i for i in range(0, 7)], help='The number of distinct intents(relation prioritizations) to model for each node type.')
+    parser.add_argument('--intent-activation', type=str, default='tanh', help='The activation function for the intent values. Value can by any supported by keras.')
+    parser.add_argument('--message-activation', type=str, default='linear', help='The activation function for the passed messages. Value can by any supported by keras.')
     parser.add_argument('--name', '-n', '-o', type=str, help='The folder under ml_files to save the model in.')
-    parser.add_argument('--regularization', '--reg', '-r', default=1, type=float, help='The relative weight of regularization vs reproducing cubes.')
-    # parser.add_argument('--card-reconstruction', '--card-rec', '-cr', default=0.1, type=float, help='The relative weight of reconstructing individual cards vs reproducing cubes.')
-    parser.add_argument('--noise', type=float, help='The mean number of random swaps to make per cube.')
+    parser.add_argument('--noise', type=float, default=0.5, help='The mean number of random swaps to make per cube.')
     parser.add_argument('--noise-stddev', type=float, default=0.1, help="The standard deviation of the amount of noise to apply.")
     parser.add_argument('--learning-rate', type=float, default=1e-04, help="The initial learning rate.")
-    parser.add_argument('--seed', type=int, default=None, help="A random seed to provide reproducible runs.")
+    parser.add_argument('--seed', type=int, default=37, help="A random seed to provide reproducible runs.")
     parser.add_argument('--xla', action='store_true', help='Use the XLA optimizer on the model.')
     parser.add_argument('--profile', action='store_true', help='Run profiling on part of the second batch to analyze performance.')
     parser.add_argument('--debug', action='store_true', help='Enable dumping debug information to logs/debug.')
@@ -40,8 +48,8 @@ if __name__ == '__main__':
     maps = data / 'maps'
     int_to_card_filepath = maps / 'int_to_card.json'
     cube_folder = data / "cubes"
+    decks_folder = data / "decks"
     log_dir = Path("logs/fit/") / datetime.now().strftime("%Y%m%d-%H%M%S")
-
 
     def load_adj_mtx():
         print('Loading Adjacency Matrix . . .\n')
@@ -84,8 +92,7 @@ if __name__ == '__main__':
         random.seed(seed)
         print("Reset random seeds")
 
-    if args.seed is not None:
-        reset_random_seeds(args.seed)
+    reset_random_seeds(args.seed)
 
     if args.debug:
         log_dir = "logs/debug/"
@@ -102,7 +109,15 @@ if __name__ == '__main__':
 
     print('Setting Up Model . . . \n')
     checkpoint_dir = output / 'model'
-    autoencoder = CC_Recommender(num_cards)
+    recommender = KGRecommender(cubes=utils.build_sparse_cubes(cube_folder, card_to_int),
+                                decks=utils.build_deck_with_sides(decks_folder, card_to_int),
+                                num_cards=num_cards, batch_size=args.batch_size, num_layers=args.layers,
+                                entity_dims=args.entity_dims, normalize=args.normalize,
+                                relation_dims=args.relation_dims, initializer=args.initializer,
+                                return_weights=True, relation_activation=args.relation_activation,
+                                message_dropout=args.message_dropout, num_intents=args.intents,
+                                intent_activation=args.intent_activation, message_activation=args.message_activation)
+
     latest = tf.train.latest_checkpoint(str(output))
     if latest is not None:
         print('Loading Checkpoint. Saved values are:')

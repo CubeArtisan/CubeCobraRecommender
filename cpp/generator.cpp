@@ -49,12 +49,20 @@ std::valarray<std::size_t> sample_no_replacement(const std::size_t count, std::v
     return results;
 }
 
+template<bool use_adj_mtx>
 struct Generator {
-    using result_type = std::tuple<std::tuple<py::array_t<double>, py::array_t<double>>,
-                                   std::tuple<py::array_t<double>, py::array_t<double>>>;
-    using queue_values = std::tuple<std::array<std::size_t, 2>,
-                                    std::tuple<std::valarray<double>, std::valarray<double>>,
-                                    std::tuple<std::valarray<double>, std::valarray<double>>>;
+    using result_type = std::conditional_t<use_adj_mtx,
+        std::tuple<std::tuple<py::array_t<double>, py::array_t<double>>,
+                   std::tuple<py::array_t<double>, py::array_t<double>>>,
+        std::tuple<py::array_t<double>, py::array_t<double>>
+    >;
+    using queue_values = std::conditional_t<use_adj_mtx,
+        std::tuple<std::array<std::size_t, 2>,
+                   std::tuple<std::valarray<double>, std::valarray<double>>,
+                   std::tuple<std::valarray<double>, std::valarray<double>>>,
+        std::tuple<std::array<std::size_t, 2>,
+                   std::tuple<std::valarray<double>, std::valarray<double>>>
+    >;
 private:
     std::size_t num_cards;
     std::size_t num_cubes;
@@ -87,7 +95,7 @@ public:
               double noise, double noise_std)
             : num_cards{static_cast<std::size_t>(adj_mtx.shape(0))}, num_cubes{static_cast<std::size_t>(cubes.shape(0))},
               num_threads{num_workers},
-              max_batch_size{batch_size}, length{(num_cubes + batch_size - 1) / batch_size},
+              max_batch_size{batch_size}, length{use_adj_mtx ? (num_cubes + batch_size - 1) / batch_size : num_cubes / batch_size},
               initial_seed{seed},
               x_mtx({cubes.data(), static_cast<std::size_t>(cubes.size())}),
               y_mtx({adj_mtx.data(), static_cast<std::size_t>(adj_mtx.size())}),
@@ -147,33 +155,43 @@ public:
         for (size_t i=0; i < full_batches; i++) {
             tasks.emplace_back(indices.begin() + i * max_batch_size, indices.begin() + (i + 1) * max_batch_size);
         }
-        if (full_batches < length) {
-            tasks.emplace_back(indices.begin() + full_batches * max_batch_size, indices.end());
+        if constexpr (use_adj_mtx) {
+            if (full_batches < length) {
+                tasks.emplace_back(indices.begin() + full_batches * max_batch_size, indices.end());
+            }
         }
-        task_queue.enqueue_bulk(task_producer, std::make_move_iterator(tasks.begin()), length);
+        task_queue.enqueue_bulk(task_producer, std::make_move_iterator(tasks.begin()), tasks.size());
     }
 
     result_type next() {
         queue_values result;
         if (task_queue.size_approx() < num_threads && result_queue.size_approx() < 2 * max_batch_size) queue_new_epoch();
         result_queue.wait_dequeue(result_consumer, result);
-        return {
-            {
+        if constexpr (use_adj_mtx) {
+            return {
+                {
+                    py::array_t<double>(std::get<0>(result), &std::get<0>(std::get<1>(result))[0]),
+                    py::array_t<double>(std::get<0>(result), &std::get<1>(std::get<1>(result))[0]),
+                },
+                {
+                    py::array_t<double>(std::get<0>(result), &std::get<0>(std::get<2>(result))[0]),
+                    py::array_t<double>(std::get<0>(result), &std::get<1>(std::get<2>(result))[0]),
+                },
+            };
+        } else {
+            return {
                 py::array_t<double>(std::get<0>(result), &std::get<0>(std::get<1>(result))[0]),
                 py::array_t<double>(std::get<0>(result), &std::get<1>(std::get<1>(result))[0]),
-            },
-            {
-                py::array_t<double>(std::get<0>(result), &std::get<0>(std::get<2>(result))[0]),
-                py::array_t<double>(std::get<0>(result), &std::get<1>(std::get<2>(result))[0]),
-            },
-        };
+            };
+        }
     }
+
 
     result_type getitem(std::size_t) {
         return next();
     }
 
-    std::array<std::valarray<double>, 4> process_cube(const std::size_t index, pcg32& rng) {
+    std::array<std::valarray<double>, 2> process_cube(const std::size_t index, pcg32& rng) {
         double noise = std::ranges::clamp(noise_dist(rng), 0.3, 0.7);
         std::valarray<double> x1 = x_mtx[std::slice(index * num_cards, num_cards, 1)];
         std::size_t count = static_cast<std::size_t>(x1.sum());
@@ -190,6 +208,10 @@ public:
         x1[to_include] = 1;
         y1[y_to_exclude] = 0;
 
+        return {x1, y1};
+    }
+
+    std::array<std::valarray<double>, 2> process_adj_mtx(pcg32& rng) {
         /* const double rand_value = neg_sampler_rand(rng); */
         /* auto found_iter = std::upper_bound(std::begin(replacing_neg_sampler), std::end(replacing_neg_sampler), rand_value); */
         /* const std::size_t card_index = found_iter != std::end(replacing_neg_sampler) ? std::distance(std::begin(replacing_neg_sampler), found_iter) : replacing_neg_sampler.size() - 1; */
@@ -199,7 +221,7 @@ public:
         std::valarray<double> x2(0.0, num_cards);
         x2[actual_index] = 1;
 
-        return {x1, x2, y1, y_mtx[std::slice(actual_index * num_cards, num_cards, 1)]};
+        return {x2, y_mtx[std::slice(actual_index * num_cards, num_cards, 1)]};
     }
 
     void worker_thread(std::stop_token st, pcg32 rng) {
@@ -210,30 +232,43 @@ public:
             // Time here is in microseconds.
             if(task_queue.wait_dequeue_timed(consume_token, task, 100'000)) {
                 std::valarray<double> result_x1(task.size() * num_cards);
-                std::valarray<double> result_x2(task.size() * num_cards);
                 std::valarray<double> result_y1(task.size() * num_cards);
-                std::valarray<double> result_y2(task.size() * num_cards);
                 size_t offset = 0;
                 for (const size_t index : task) {
-                    const auto [x1, x2, y1, y2] = process_cube(index, rng);
+                    const auto [x1, y1] = process_cube(index, rng);
                     result_x1[std::slice(offset * num_cards, num_cards, 1)] = x1;
-                    result_x2[std::slice(offset * num_cards, num_cards, 1)] = x2;
                     result_y1[std::slice(offset * num_cards, num_cards, 1)] = y1;
-                    result_y2[std::slice(offset * num_cards, num_cards, 1)] = y2;
                     offset++;
                 }
                 const std::array<std::size_t, 2> shape{task.size(), num_cards};
-                result_queue.enqueue(produce_token, std::tuple{
-                    shape,
-                    std::tuple{
-                        result_x1,
-                        result_x2,
-                    },
-                    std::tuple{
-                        result_y1,
-                        result_y2,
+                if constexpr (use_adj_mtx) {
+                    std::valarray<double> result_x2(task.size() * num_cards);
+                    std::valarray<double> result_y2(task.size() * num_cards);
+                    for (size_t i=0; i < task.size(); i++) {
+                        const auto [x2, y2] = process_adj_mtx(rng);
+                        result_x2[std::slice(offset * num_cards, num_cards, 1)] = x2;
+                        result_y2[std::slice(offset * num_cards, num_cards, 1)] = y2;
                     }
-                });
+                    result_queue.enqueue(produce_token, std::tuple{
+                        shape,
+                        std::tuple{
+                            result_x1,
+                            result_x2,
+                        },
+                        std::tuple{
+                            result_y1,
+                            result_y2,
+                        }
+                    });
+                } else {
+                    result_queue.enqueue(produce_token, std::tuple{
+                        shape,
+                        std::tuple{
+                            result_x1,
+                            result_y1,
+                        }
+                    });
+                }
             }
         }
     }
@@ -241,17 +276,24 @@ public:
 
 PYBIND11_MODULE(generator, m) {
     using namespace pybind11::literals;
-    py::object KerasSequence = py::module_::import("tensorflow.keras.utils").attr("Sequence");
-    py::class_<Generator>(m, "Generator")
+    py::class_<Generator<true>>(m, "GeneratorWithAdj")
         .def(py::init<py::array_t<double, py::array::c_style>,
                       py::array_t<double, py::array::c_style>,
                       std::size_t, std::size_t, std::size_t,
                       double, double>())
-                      /* double, double>("adj_mtx"_a, "cubes"_a, "num_workers"_a, "batch_size"_a, */
-                      /*                 "seed"_a, "noise"_a=0.3, "noise_std"_a=0.1)) */
-        .def("__enter__", &Generator::enter)
-        .def("__exit__", &Generator::exit)
-        .def("__len__", &Generator::size)
-        .def("__getitem__", &Generator::getitem)
-        .def("on_epoch_end", &Generator::queue_new_epoch);
+        .def("__enter__", &Generator<true>::enter)
+        .def("__exit__", &Generator<true>::exit)
+        .def("__len__", &Generator<true>::size)
+        .def("__getitem__", &Generator<true>::getitem)
+        .def("on_epoch_end", &Generator<true>::queue_new_epoch);
+    py::class_<Generator<false>>(m, "GeneratorWithoutAdj")
+        .def(py::init<py::array_t<double, py::array::c_style>,
+                      py::array_t<double, py::array::c_style>,
+                      std::size_t, std::size_t, std::size_t,
+                      double, double>())
+        .def("__enter__", &Generator<false>::enter)
+        .def("__exit__", &Generator<false>::exit)
+        .def("__len__", &Generator<false>::size)
+        .def("__getitem__", &Generator<false>::getitem)
+        .def("on_epoch_end", &Generator<false>::queue_new_epoch);
 }
