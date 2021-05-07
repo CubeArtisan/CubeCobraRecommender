@@ -22,17 +22,23 @@ if __name__ == '__main__':
     import src.non_ml.utils as utils
     import tensorflow as tf
 
-    from src.ml.kgin import KGRecommender, EDGE_TYPES, NODE_TYPES
+    from src.ml.kgin import KGRecommender, EDGE_TYPES, NODE_TYPES, NUM_EDGE_TYPES
     from src.generated.generator import GeneratorWithoutAdj
 
     locale.setlocale(locale.LC_ALL, '')
 
+    physical_devices = tf.config.list_physical_devices('GPU')
+    try:
+        tf.config.experimental.set_memory_growth(physical_devices[0], True)
+    except:
+        print('Could not enable dynamic memory growth on the GPU.')
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--epochs', '-e', type=int, help='The number of epochs to train for.')
-    parser.add_argument('--batch-size', '-b', type=int, choices=[2**i for i in range(0, 16)], help='The number of cubes/cards to train on at a time.')
+    parser.add_argument('--batch-size', type=int, choices=[2**i for i in range(0, 15)], help='The number of cubes to process at a time.')
+    parser.add_argument('--chunk-size', type=int, choices=[2**i for i in range(0, 18)], help='The number of edges to process at a time.')
     parser.add_argument('--layers', type=int, default=3, choices=list(range(9)), help='The number of message passing layers.')
     parser.add_argument('--entity-dims', type=int, default=128, choices=[2**i for i in range(0, 12)], help='The number of dimensions for the node embeddings')
-    parser.add_argument('--normalize', type=int, default=None, choices=[1, 2], help='The kind of normalization to apply to the embeddings, L1 or L2 default is no normalization.')
     parser.add_argument('--edge-type-dims', type=int, default=64, choices=[2**i for i in range(0, 10)], help='The number of dimensions for the edge_type specific views of the node embeddings.')
     parser.add_argument('--initializer', type=str, default='glorot_uniform', help='The initializer for the model weights, value can be any supported by keras.')
     parser.add_argument('--edge-type-activation', type=str, default='linear', help='The activation function for mapping to the edge_type views of nodes. Value can be any supported by keras.')
@@ -40,8 +46,6 @@ if __name__ == '__main__':
     parser.add_argument('--intents', type=int, default=4, choices=[2**i for i in range(0, 7)], help='The number of distinct intents(edge_type prioritizations) to model for each node type.')
     parser.add_argument('--intent-activation', type=str, default='tanh', help='The activation function for the intent values. Value can by any supported by keras.')
     parser.add_argument('--message-activation', type=str, default='linear', help='The activation function for the passed messages. Value can by any supported by keras.')
-    parser.add_argument('--chunks', type=int, default=64, choices=[2**i for i in range(0, 18)], help='The number of chunks to break up the edges into for processing to reduce memory usage.')
-    parser.add_argument('--min-chunk-size', type=int, default=8192, choices=[2**i for i in range(0, 18)], help='The smallest size for the edge chunks.')
     parser.add_argument('--name', '-n', '-o', type=str, help='The folder under ml_files to save the model in.')
     parser.add_argument('--noise', type=float, default=0.5, help='The mean number of random swaps to make per cube.')
     parser.add_argument('--noise-stddev', type=float, default=0.1, help="The standard deviation of the amount of noise to apply.")
@@ -127,7 +131,6 @@ if __name__ == '__main__':
             op_regex="(?!^(Placeholder|Constant)$)"
         )
 
-    print("Setting jit flag")
     tf.config.optimizer.set_jit(args.xla)
     if args.xla:
         def jit_scope():
@@ -135,6 +138,8 @@ if __name__ == '__main__':
     else:
         def jit_scope():
             return contextlib.nullcontext()
+    tf.config.set_soft_device_placement(True)
+    tf.keras.mixed_precision.set_global_policy(args.dtype_policy)
     tf.config.optimizer.set_experimental_options=({
         'layout_optimizer': True,
         'constant_folding': True,
@@ -149,51 +154,79 @@ if __name__ == '__main__':
         'scoped_allocator_optimization': True,
         'pin_to_host_optimization': True,
         'implementation_selector': True,
-        # 'auto_mixed_precision': True,
         'disable_meta_optimizer': False,
-        'min_graph_nodes': 8,
+        'min_graph_nodes': 1,
     })
     tf.config.threading.set_intra_op_parallelism_threads(32)
     tf.config.threading.set_inter_op_parallelism_threads(32)
-    tf.config.set_soft_device_placement(True)
-    tf.keras.mixed_precision.set_global_policy(args.dtype_policy)
     if args.mlir:
         print('MLIR is very experimental currently and so may cause errors.')
         tf.config.experimental.enable_mlir_graph_optimization()
         tf.config.experimental.enable_mlir_bridge()
 
-    print('Setting Up Model . . . \n')
-    checkpoint_dir = output / 'checkpoint'
-    cubes = utils.build_sparse_cubes(cube_folder, card_to_int, is_valid_cube)
-    decks = utils.build_deck_with_sides(decks_folder, card_to_int,
-                                        lambda deck: len(deck['side']) > 5 and 22 <= len(deck['main']) <= 100)
-    recommender = KGRecommender(num_cubes=len(cubes), num_decks=len(decks),
-                                num_cards=num_cards, batch_size=args.batch_size, num_layers=args.layers,
-                                entity_dims=args.entity_dims, normalize=args.normalize, num_chunks=args.chunks,
-                                edge_type_dims=args.edge_type_dims, initializer=args.initializer,
-                                return_weights=False, edge_type_activation=args.edge_type_activation,
-                                message_dropout=args.message_dropout, num_intents=args.intents,
-                                intent_activation=args.intent_activation, message_activation=args.message_activation,
-                                jit_scope=jit_scope, name='knowledge_graph_cube_recommender')
+    class GeneratorWrapper(tf.keras.utils.Sequence):
+        def __init__(self, generator, decks, cubes, num_cards, chunk_size, batch_size):
+            self.num_decks = len(decks)
+            self.num_cubes = len(cubes)
+            self.num_cards = num_cards
+            self.chunk_size = chunk_size
+            self.batch_size = batch_size
+            self.cube_start_index = 0
+            self.deck_start_index = self.cube_start_index + self.num_cubes
+            self.card_start_index = self.deck_start_index + self.num_decks
+            self.placeholder_index = self.card_start_index + self.num_cards
+            self.batch_start_index = self.placeholder_index + 1
+            self.num_entities = self.batch_start_index + self.batch_size
+            self.generator = generator
+            node_types = [-1 for _ in range(self.placeholder_index)]
+            for i in range(self.cube_start_index, self.cube_start_index + self.num_cubes):
+                node_types[i] = NODE_TYPES.CUBE
+            for i in range(self.deck_start_index, self.deck_start_index + self.num_decks):
+                node_types[i] = NODE_TYPES.DECK
+            for i in range(self.card_start_index, self.card_start_index + self.num_cards):
+                node_types[i] = NODE_TYPES.CARD
+            self.edges = [(i, i, getattr(EDGE_TYPES, f'REFLEXIVE_{node_type.name}'))
+                          for i, node_type in enumerate(node_types)]
+            for i, cube in enumerate(tqdm(cubes, unit='cube', dynamic_ncols=True, unit_scale=True)):
+                self._add_edges(self.cube_start_index + i, set(cube), EDGE_TYPES.CUBE_CONTAINS,
+                                EDGE_TYPES.IN_CUBE)
+            for i, deck in enumerate(tqdm(decks, unit='deck', dynamic_ncols=True, unit_scale=True)):
+                deck_id = self.deck_start_index + i
+                self._add_edges(deck_id, set(deck['main']), EDGE_TYPES.MAIN_CONTAINS, EDGE_TYPES.IN_MAIN)
+                self._add_edges(deck_id, set(deck['side']), EDGE_TYPES.SIDE_CONTAINS, EDGE_TYPES.IN_SIDE)
+                if deck['cube'] is not None:
+                    cube_id = self.cube_start_index + deck['cube']
+                    self.edges.append((deck_id, cube_id, EDGE_TYPES.DECK_FROM))
+                    self.edges.append((cube_id, deck_id, EDGE_TYPES.DECK_FOR_CUBE))
+            # self.edges = sorted(self.edges, key=lambda x: (x[1], x[0]))
+            self.edges = np.int32(self.edges)
+            print(f'There are {self.num_entities - self.batch_size:n} nodes and {len(self.edges):n} edges which is an average of {len(self.edges) / (self.num_entities - self.batch_size):n} edges per node.')
+            self.placeholder_edge = np.int32((self.placeholder_index, self.placeholder_index, EDGE_TYPES.REFLEXIVE_PLACEHOLDER))
 
-    latest = tf.train.latest_checkpoint(str(output))
-    if latest is not None:
-        print('Loading Checkpoint. Saved values are:')
-        recommender.load_weights(latest)
-    THRESHOLDS=[0.1, 0.25, 0.5, 0.75, 0.9]
-    recommender.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=args.learning_rate),
-        loss=tf.keras.losses.BinaryCrossentropy(name='cube_loss'),
-        metrics=[
-            (
-                *[tf.keras.metrics.Recall(t, name=f'cube_recall_{t}') for t in THRESHOLDS],
-                *[tf.keras.metrics.PrecisionAtRecall(t, name=f'cube_prec_at_recall_{t}') for t in THRESHOLDS],
-                *[tf.keras.metrics.RecallAtPrecision(t, name=f'cube_recall_at_precision_{t}') for t in THRESHOLDS],
-                *[tf.keras.metrics.Precision(t, name=f'cube_precision_{t}') for t in THRESHOLDS],
-            ),
-        ],
-        from_serialized=True,
-    )
+        def _add_edges(self, entity_id, card_ids, out_edge_type, in_edge_type):
+            self.edges += [(entity_id, self.card_start_index + card_id, out_edge_type) for card_id in card_ids]
+            self.edges += [(self.card_start_index + card_id, entity_id,  in_edge_type) for card_id in card_ids]
+
+        def __getitem__(self, item):
+            x, y = self.generator.__getitem__(item)
+            cube_indices, card_indices = np.int32(x.nonzero())
+            edges = list(set(zip(card_indices + self.card_start_index, cube_indices,
+                                 (EDGE_TYPES.IN_CUBE for _ in cube_indices))))
+            edges = np.int32(edges)
+            placeholder_count = -(len(self.edges) + len(edges)) % self.chunk_size
+            # edges = sorted(edges, key=lambda x: (x[1], x[0]))
+            if placeholder_count > 0:
+                placeholder_edges = np.tile(self.placeholder_edge, (placeholder_count, 1))
+                edges = np.concatenate([placeholder_edges, edges], 0)
+            sources = tf.convert_to_tensor(edges[:, 0].reshape(-1), dtype=tf.int32, name='new_sources')
+            targets = tf.convert_to_tensor(edges[:, 1].reshape(-1), dtype=tf.int32, name='new_targets')
+            edge_types = np.zeros((len(edges), NUM_EDGE_TYPES))
+            edge_types[:, edges[:, 2]] = 1.0
+            edge_types = tf.convert_to_tensor(edge_types, dtype=tf.float32, name='new_edge_types')
+            return (sources, targets, edge_types), y
+
+        def __len__(self):
+            return len(self.generator)
 
     print(f'Creating a pool with {args.num_workers} different workers.')
     generator = GeneratorWithoutAdj(
@@ -206,128 +239,47 @@ if __name__ == '__main__':
         args.noise_stddev,
     )
 
-    class GeneratorWrapper(tf.keras.utils.Sequence):
-        def __init__(self, generator, decks, cubes, num_cards, batch_size, num_layers, num_chunks, min_chunk_size):
-            self.num_layers = num_layers
-            self.num_cards = num_cards
-            self.batch_size = batch_size
-            self.num_decks = len(decks)
-            self.num_cubes = len(cubes)
-            self.min_chunk_size = min_chunk_size
-            self.num_chunks = num_chunks
-            self.cube_start_index = self.batch_size
-            self.deck_start_index = self.cube_start_index + self.num_cubes
-            self.card_start_index = self.deck_start_index + self.num_decks
-            self.num_entities = self.card_start_index + self.num_cards
-            self.generator = generator
-            self.recommender = recommender
-            self.edges = set()
-            self.node_types = [-1 for _ in range(self.num_entities)]
-            for i in range(self.batch_size):
-                self.node_types[i] = NODE_TYPES.CUBE
-            for i in range(self.cube_start_index, self.cube_start_index + self.num_cubes):
-                self.node_types[i] = NODE_TYPES.CUBE
-            for i in range(self.deck_start_index, self.deck_start_index + self.num_decks):
-                self.node_types[i] = NODE_TYPES.DECK
-            for i in range(self.card_start_index, self.card_start_index + self.num_cards):
-                self.node_types[i] = NODE_TYPES.CARD
-            for i, cube in enumerate(tqdm(cubes, unit='cube', dynamic_ncols=True, unit_scale=True)):
-                self._add_edges(self.cube_start_index + i, cube, EDGE_TYPES.CUBE_CONTAINS,
-                                EDGE_TYPES.IN_CUBE, NODE_TYPES.CUBE)
-            for i, deck in enumerate(tqdm(decks, unit='deck', dynamic_ncols=True, unit_scale=True)):
-                deck_id = self.deck_start_index + i
-                self._add_edges(deck_id, deck['main'], EDGE_TYPES.POOL_CONTAINS, EDGE_TYPES.IN_POOL,
-                                NODE_TYPES.DECK)
-                self._add_edges(deck_id, deck['main'], EDGE_TYPES.MAIN_CONTAINS, EDGE_TYPES.IN_MAIN,
-                                NODE_TYPES.DECK)
-                self._add_edges(deck_id, deck['side'], EDGE_TYPES.POOL_CONTAINS, EDGE_TYPES.IN_POOL,
-                                NODE_TYPES.DECK)
-                self._add_edges(deck_id, deck['side'], EDGE_TYPES.SIDE_CONTAINS, EDGE_TYPES.IN_SIDE,
-                                NODE_TYPES.DECK)
-            self.edges.update((i, i, self.node_types[i], EDGE_TYPES.REFLEXIVE) for i in range(self.batch_size, self.num_entities))
-            self.edges = np.int32(list(self.edges))
-            print(f'There are {self.num_entities:n} nodes and {len(self.edges):n} edges which is an average of {len(self.edges) / self.num_entities:n} edges per node.')
-            # self._populate_edges_by_card(num_cards, num_layers)
-
-        def _populate_edges_by_card(self, num_cards, num_layers):
-            edges_by_target = [[] for _ in range(self.num_entities)]
-            for i, edge in enumerate(tqdm(self.edges, unit='edge', unit_scale=True, dynamic_ncols=True)):
-                edges_by_target[edge[1]].append(i)
-            edges_by_target = [np.int32(indices) for indices in edges_by_target]
-            sources_by_target = [np.int32(list(set(self.edges[idx][0] for idx in indices)))
-                                 for indices in tqdm(edges_by_target, unit='node', unit_scale=True, dynamic_ncols=True)]
-            self.edges_by_card = []
-            closure_size = 0
-            for card_id in tqdm(list(range(self.card_start_index, self.card_start_index + num_cards)),
-                                unit='card', unit_scale=True, dynamic_ncols=True):
-                edges = []
-                nodes = {card_id}
-                new_nodes = {card_id}
-                # One hop is from the batch cubes to cards so we have 1 less layer to consider here.
-                for j in range(num_layers - 1):
-                    edges += list(itertools.chain.from_iterable(edges_by_target[target] for target in new_nodes))
-                    # We can skip this on the last layer to save a little time
-                    if j < num_layers - 2:
-                        new_nodes = set(itertools.chain.from_iterable(sources_by_target[target] for target in new_nodes)) - nodes
-                        nodes.update(new_nodes)
-                closure_size += len(edges)
-                self.edges_by_card.append(np.int32(edges))
-            print(f'There are {closure_size:n} edges in the {num_layers - 1}-hop neighborhood of the cards which is {closure_size / num_cards:.2f} edges per node.')
-
-        def _add_edges(self, entity_id, card_ids, out_edge_type, in_edge_type, entity_type):
-            self.edges.update((entity_id, self.card_start_index + card_id, NODE_TYPES.CARD, out_edge_type) for card_id in card_ids)
-            self.edges.update((self.card_start_index + card_id, entity_id,     entity_type,  in_edge_type) for card_id in card_ids)
-
-        def calculate_closure(self, target_indices, edges):
-            print('Started calculating closure')
-            cumulative_bitvector = np.zeros((self.num_entities,), dtype=np.bool_)
-            cur_bitvector = np.zeros((self.num_entities,), dtype=np.bool_)
-            cumulative_bitvector[target_indices] = 1
-            cur_bitvector[target_indices] = 1
-            for _ in range(self.num_layers - 1):
-                sources = edges[cur_bitvector[edges[:, 1]]][:, 0]
-                cur_bitvector = np.zeros((self.num_entities,), dtype=np.bool_)
-                cur_bitvector[sources] = 1
-                cur_bitvector = cur_bitvector & np.logical_not(cumulative_bitvector)
-                cumulative_bitvector = cumulative_bitvector | cur_bitvector
-            return edges[cumulative_bitvector[edges[:, 1]]]
-
-        def __getitem__(self, item):
-            x, y = self.generator.__getitem__(item)
-            cube_indices, card_indices = np.int32(x.nonzero())
-            edges = list(set(zip(
-                card_indices + self.card_start_index,
-                cube_indices,
-                [NODE_TYPES.CUBE for _ in cube_indices],
-                [EDGE_TYPES.IN_CUBE for _ in cube_indices],
-            ))) + [(i, i, NODE_TYPES.CUBE, EDGE_TYPES.REFLEXIVE) for i in range(self.batch_size)]
-            edges = np.concatenate([self.edges, np.int32(sorted(edges, key=lambda x: (x[1], x[0])))], 0)
-            edges = self.calculate_closure(np.arange(self.batch_size), edges)
-            chunks = []
-            chunk_size = len(edges) // self.num_chunks
-            print(f'Making chunks of size {chunk_size:n} out of {len(edges):n} edges')
-            next_start = 0
-            for i in range(self.num_chunks):
-                if next_start == len(edges):
-                    chunks.append(tf.constant([], shape=(0,), dtype=tf.int32))
-                    continue
-                guess = min(max(next_start + self.min_chunk_size, (i + 1) * chunk_size), len(edges) - 1)
-                while guess < len(edges) - 1 and edges[guess][1] == edges[guess + 1][1]:
-                    guess += 1
-                chunks.append(tf.range(next_start, guess + 1, dtype=tf.int32))
-                next_start = guess + 1
-            return (edges, chunks), y
-
-        def __len__(self):
-            return len(self.generator)
-
     with generator:
         print('Setting up graph and lookup tables')
-        wrapped = GeneratorWrapper(generator, decks=decks, cubes=cubes, num_layers=args.layers,
-                                   batch_size=args.batch_size, num_cards=num_cards, num_chunks=args.chunks,
-                                   min_chunk_size=args.min_chunk_size)
+        cubes, cube_ids = utils.build_sparse_cubes(cube_folder, card_to_int, is_valid_cube)
+        cube_id_to_index = {v: i for i, v in enumerate(cube_ids)}
+        decks = utils.build_deck_with_sides(decks_folder, card_to_int, cube_id_to_index,
+                                            lambda deck: len(deck['side']) > 5 and 23 <= len(deck['main']) <= 60)
+        wrapped = GeneratorWrapper(generator, decks=decks, cubes=cubes,
+                                   num_cards=num_cards, chunk_size=args.chunk_size, batch_size=args.batch_size)
+
+        print('Setting Up Model . . . \n')
+        checkpoint_dir = output / 'checkpoint'
+        recommender = KGRecommender(num_cubes=len(cubes), num_decks=len(decks), chunk_size=args.chunk_size,
+                                    num_cards=num_cards, batch_size=args.batch_size, num_layers=args.layers,
+                                    entity_dims=args.entity_dims, edges=wrapped.edges,
+                                    edge_type_dims=args.edge_type_dims, initializer=args.initializer,
+                                    edge_type_activation=args.edge_type_activation,
+                                    message_dropout=args.message_dropout, num_intents=args.intents,
+                                    intent_activation=args.intent_activation, message_activation=args.message_activation,
+                                    jit_scope=jit_scope, name='knowledge_graph_cube_recommender')
         del decks
         del cubes
+
+        latest = tf.train.latest_checkpoint(str(output))
+        if latest is not None:
+            print('Loading Checkpoint. Saved values are:')
+            recommender.load_weights(latest)
+        THRESHOLDS=[0.1, 0.25, 0.5, 0.75, 0.9]
+        recommender.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=args.learning_rate),
+            loss=tf.keras.losses.BinaryCrossentropy(name='cube_loss'),
+            metrics=[
+                (
+                    *[tf.keras.metrics.Recall(t, name=f'cube_recall_{t}') for t in THRESHOLDS],
+                    *[tf.keras.metrics.PrecisionAtRecall(t, name=f'cube_precision_at_recall_{t}') for t in THRESHOLDS],
+                    *[tf.keras.metrics.RecallAtPrecision(t, name=f'cube_recall_at_precision_{t}') for t in THRESHOLDS],
+                    *[tf.keras.metrics.Precision(t, name=f'cube_precision_{t}') for t in THRESHOLDS],
+                ),
+            ],
+            from_serialized=True,
+        )
+
         print('Starting training')
         output.mkdir(exist_ok=True, parents=True)
         callbacks = []
@@ -346,12 +298,12 @@ if __name__ == '__main__':
                                                            min_lr=1 / (2 ** 20),
                                                            verbose=True)
         tb_callback = TensorBoardFix(log_dir=log_dir, histogram_freq=1, write_graph=True,
-                                     update_freq=num_cubes // 10 // args.batch_size,
+                                     update_freq=num_cubes // 10 // num_cubes,
                                      profile_batch=0 if not args.profile
-                                     else (int(1.4 * num_cubes / args.batch_size),
-                                           int(1.6 * num_cubes / args.batch_size)))
-        tqdm_callback = TqdmCallback(epochs=args.epochs, data_size=num_cubes, batch_size=args.batch_size,
-                                     tqdm_class=tqdm, dynamic_ncols=True)
+                                     else (int(1.4 * num_cubes / num_cubes),
+                                           int(1.6 * num_cubes / num_cubes)))
+        tqdm_callback = TqdmCallback(epochs=args.epochs, data_size=len(wrapped) * args.batch_size,
+                                     batch_size=args.batch_size, dynamic_ncols=True)
         callbacks.append(mcp_callback)
         callbacks.append(nan_callback)
         callbacks.append(tb_callback)

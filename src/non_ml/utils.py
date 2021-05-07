@@ -84,6 +84,7 @@ def build_cubes(cube_folder, num_cubes, num_cards, card_to_int,
 
 def build_sparse_cubes(cube_folder, card_to_int, validation_func=lambda _: True):
     cubes = []
+    cube_ids = []
     for filename in tqdm(list(cube_folder.iterdir()), dynamic_ncols=True, unit='file'):
         with open(filename, 'rb') as cube_file:
             contents = json.load(cube_file)
@@ -97,7 +98,8 @@ def build_sparse_cubes(cube_folder, card_to_int, validation_func=lambda _: True)
                             card_ids.append(card_id)
                 if len(card_ids) > 0:
                     cubes.append(card_ids)
-    return cubes
+                    cube_ids.append(cube['id'])
+    return cubes, cube_ids
 
 
 def build_decks(deck_folder, num_decks, num_cards,
@@ -124,7 +126,7 @@ def build_decks(deck_folder, num_decks, num_cards,
     return decks
 
 
-def build_deck_with_sides(deck_folder, card_to_int, validation_func=lambda _: True):
+def build_deck_with_sides(deck_folder, card_to_int, cube_id_to_index, validation_func=lambda _: True):
     decks = []
     counter = 0
     for filename in tqdm(list(deck_folder.iterdir()), dynamic_ncols=True, unit='file'):
@@ -144,7 +146,7 @@ def build_deck_with_sides(deck_folder, card_to_int, validation_func=lambda _: Tr
                         card_id = card_to_int.get(card_name, None)
                         if card_id is not None:
                             side.append(card_id)
-                decks.append({'main': main, 'side': side})
+                decks.append({'main': main, 'side': side, 'cube': cube_id_to_index.get(deck['cubeid'], None)})
     return decks
 
 
