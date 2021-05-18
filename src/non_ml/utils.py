@@ -10,7 +10,11 @@ BAD_NAMES = [
     'swamp',
     'mountain',
     'forest',
-    '1996 world champion',
+    'snow-covered plains',
+    'snow-covered island',
+    'snow-covered swamp',
+    'snow-covered mountain',
+    'snow-covered forest',
     'invalid card',
 ]
 BAD_FUNCTIONS = [
@@ -18,17 +22,17 @@ BAD_FUNCTIONS = [
 ]
 
 
-def exclude(card_file=None):
+def get_exclusions(card_file=None):
+    exclusions = list(BAD_NAMES)
     if card_file is None:
-        return []
+        return frozenset(exclusions)
     with open(card_file, 'rb') as cf:
         card_dict = json.load(cf)
     for cd in card_dict.values():
         for bf in BAD_FUNCTIONS:
-            if bf(cd):
-                BAD_NAMES.append(cd.get('name_lower'))
-    print(BAD_NAMES)
-    return BAD_NAMES
+            if cd.get('name_lower') not in exclusions and bf(cd):
+                exclusions.append(cd.get('name_lower'))
+    return frozenset(exclusions)
 
 
 def get_card_maps(map_file, exclude_file=None):
@@ -63,90 +67,101 @@ def get_num_objs(cube_folder, validation_func=lambda _: True):
 
 
 def build_cubes(cube_folder, num_cubes, num_cards, card_to_int,
-                validation_func=lambda _: True):
+                validation_func=lambda _: True, exclusions=frozenset()):
     cubes = np.zeros((num_cubes, num_cards))
     counter = 0
-    for filename in tqdm(list(cube_folder.iterdir()), dynamic_ncols=True, unit='file'):
-        with open(filename, 'rb') as cube_file:
-            contents = json.load(cube_file)
-        for cube in contents:
-            if validation_func(cube):
-                card_ids = []
-                for card_name in cube['cards']:
-                    if card_name is not None:
-                        card_id = card_to_int.get(card_name, None)
-                        if card_id is not None:
-                            card_ids.append(card_id)
-                cubes[counter, card_ids] = 1
-                counter += 1
+    with tqdm(total=num_cubes, unit='cube', dynamic_ncols=True, unit_scale=True) as tqdm_bar:
+        for filename in cube_folder.iterdir():
+            with open(filename, 'rb') as cube_file:
+                contents = json.load(cube_file)
+            for cube in contents:
+                if validation_func(cube):
+                    card_ids = []
+                    for card_name in cube['cards']:
+                        if card_name is not None and card_name not in exclusions:
+                            card_id = card_to_int.get(card_name, None)
+                            if card_id is not None:
+                                card_ids.append(card_id)
+                    cubes[counter, card_ids] = 1
+                    counter += 1
+                    tqdm_bar.update(1)
     return cubes
 
 
-def build_sparse_cubes(cube_folder, card_to_int, validation_func=lambda _: True):
+def build_sparse_cubes(cube_folder, card_to_int, validation_func=lambda _: True, exclusions=frozenset()):
     cubes = []
     cube_ids = []
-    for filename in tqdm(list(cube_folder.iterdir()), dynamic_ncols=True, unit='file'):
-        with open(filename, 'rb') as cube_file:
-            contents = json.load(cube_file)
-        for cube in contents:
-            if validation_func(cube):
-                card_ids = []
-                for card_name in cube['cards']:
-                    if card_name is not None:
-                        card_id = card_to_int.get(card_name, None)
-                        if card_id is not None:
-                            card_ids.append(card_id)
-                if len(card_ids) > 0:
-                    cubes.append(card_ids)
-                    cube_ids.append(cube['id'])
+    num_cubes = get_num_objs(cube_folder, validation_func)
+    with tqdm(total=num_cubes, unit='cube', dynamic_ncols=True, unit_scale=True) as tqdm_bar:
+        for filename in tqdm(list(cube_folder.iterdir()), dynamic_ncols=True, unit='file'):
+            with open(filename, 'rb') as cube_file:
+                contents = json.load(cube_file)
+            for cube in contents:
+                if validation_func(cube):
+                    card_ids = []
+                    for card_name in cube['cards']:
+                        if card_name is not None and card_name not in exclusions:
+                            card_id = card_to_int.get(card_name, None)
+                            if card_id is not None:
+                                card_ids.append(card_id)
+                    if len(card_ids) > 0:
+                        cubes.append(card_ids)
+                        cube_ids.append(cube['id'])
+                    tqdm_bar.update(1)
     return cubes, cube_ids
 
 
 def build_decks(deck_folder, num_decks, num_cards,
                 card_to_int, validation_func=lambda _: True,
-                soft_validation=0):
+                soft_validation=0, exclusions=frozenset()):
     decks = np.zeros((num_decks, num_cards), dtype=np.uint8)
     counter = 0
-    for filename in tqdm(list(deck_folder.iterdir()), dynamic_ncols=True, unit='file'):
-        with open(filename, 'rb') as deck_file:
-            contents = json.load(deck_file)
-        for deck in contents:
-            if soft_validation > 0 or validation_func(deck):
-                card_ids = []
-                for card_name in deck['main']:
-                    if card_name is not None:
-                        card_id = card_to_int.get(card_name, None)
-                        if card_id is not None:
-                            card_ids.append(card_id)
-                weight = 1
-                if not validation_func(deck):
-                    weight = soft_validation
-                decks[counter, card_ids] = weight
-                counter += 1
+    with tqdm(total=num_decks, unit='deck', dynamic_ncols=True, unit_scale=True) as tqdm_bar:
+        for filename in tqdm(list(deck_folder.iterdir()), dynamic_ncols=True, unit='file'):
+            with open(filename, 'rb') as deck_file:
+                contents = json.load(deck_file)
+            for deck in contents:
+                if soft_validation > 0 or validation_func(deck):
+                    card_ids = []
+                    for card_name in deck['main']:
+                        if card_name is not None and card_name not in exclusions:
+                            card_id = card_to_int.get(card_name, None)
+                            if card_id is not None:
+                                card_ids.append(card_id)
+                    weight = 1
+                    if not validation_func(deck):
+                        weight = soft_validation
+                    decks[counter, card_ids] = weight
+                    counter += 1
+                    tqdm_bar.update(1)
     return decks
 
 
-def build_deck_with_sides(deck_folder, card_to_int, cube_id_to_index, validation_func=lambda _: True):
+def build_deck_with_sides(deck_folder, card_to_int, cube_id_to_index, validation_func=lambda _: True,
+                          exclusions=frozenset()):
     decks = []
     counter = 0
-    for filename in tqdm(list(deck_folder.iterdir()), dynamic_ncols=True, unit='file'):
-        with open(filename, 'rb') as deck_file:
-            contents = json.load(deck_file)
-        for deck in contents:
-            if validation_func(deck):
-                main = []
-                side = []
-                for card_name in deck['main']:
-                    if card_name is not None:
-                        card_id = card_to_int.get(card_name, None)
-                        if card_id is not None:
-                            main.append(card_id)
-                for card_name in deck['side']:
-                    if card_name is not None:
-                        card_id = card_to_int.get(card_name, None)
-                        if card_id is not None:
-                            side.append(card_id)
-                decks.append({'main': main, 'side': side, 'cube': cube_id_to_index.get(deck['cubeid'], None)})
+    num_decks = get_num_objs(deck_folder, validation_func)
+    with tqdm(total=num_cubes, unit='cube', dynamic_ncols=True, unit_scale=True) as tqdm_bar:
+        for filename in tqdm(list(deck_folder.iterdir()), dynamic_ncols=True, unit='file'):
+            with open(filename, 'rb') as deck_file:
+                contents = json.load(deck_file)
+            for deck in contents:
+                if validation_func(deck):
+                    main = []
+                    side = []
+                    for card_name in deck['main']:
+                        if card_name is not None and card_name not in exclusions:
+                            card_id = card_to_int.get(card_name, None)
+                            if card_id is not None:
+                                main.append(card_id)
+                    for card_name in deck['side']:
+                        if card_name is not None and card_name not in exclusions:
+                            card_id = card_to_int.get(card_name, None)
+                            if card_id is not None:
+                                side.append(card_id)
+                    decks.append({'main': main, 'side': side, 'cube': cube_id_to_index.get(deck['cubeid'], None)})
+                    tqdm_bar.update(1)
     return decks
 
 
