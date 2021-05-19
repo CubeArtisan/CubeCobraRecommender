@@ -52,6 +52,8 @@ if __name__ == '__main__':
     parser.add_argument('--profile', action='store_true', help='Run profiling on part of the second batch to analyze performance.')
     parser.add_argument('--debug', action='store_true', help='Enable dumping debug information to logs/debug.')
     parser.add_argument('--num-workers', '-j', type=int, default=1, help='Number of simulataneous workers to run to generate the data.')
+    parser.add_argument('--xla', action='store_true', help='Use the XLA optimizer on the model.')
+    parser.add_argument('--mlir', action='store_true', help='Highly experimental option to use the MLIR optimizer in tensorflow.')
     precision_group = parser.add_mutually_exclusive_group()
     precision_group.add_argument('--mixed', action='store_const', dest='dtype_policy', const='mixed_float16',
                                  help='Enable the automatic mixed-precision support in Keras.')
@@ -124,9 +126,20 @@ if __name__ == '__main__':
             log_dir,
             tensor_debug_mode='FULL_HEALTH',
             circular_buffer_size=-1,
-            op_regex="(?!^(Placeholder|Constant)$)"
+            # op_regex=b"(?!^(Placeholder|Constant)$)"
         )
 
+    tf.config.optimizer.set_jit(args.xla)
+    if args.xla:
+        def jit_scope():
+            return tf.xla.experimental.jit_scope(compile_ops=True, separate_compiled_gradients=True)
+    else:
+        def jit_scope():
+            return contextlib.nullcontext()
+    if args.mlir:
+        print('MLIR is very experimental currently and so may cause errors.')
+        tf.config.experimental.enable_mlir_graph_optimization()
+        tf.config.experimental.enable_mlir_bridge()
     tf.config.set_soft_device_placement(True)
     tf.keras.mixed_precision.set_global_policy(args.dtype_policy)
     tf.config.optimizer.set_experimental_options=({
@@ -150,11 +163,12 @@ if __name__ == '__main__':
     tf.config.threading.set_inter_op_parallelism_threads(64)
 
     class GeneratorWrapper(tf.keras.utils.Sequence):
-        def __init__(self, generator, decks, num_cards):
+        def __init__(self, generator, decks, num_cards, batch_size):
             self.generator = generator
             self.num_decks = len(decks)
             self.decks = decks
             self.num_cards = num_cards
+            self.batch_size = batch_size
 
         def get_one_hot(self, deck_indices, max_one=False):
             deck = np.zeros((self.num_cards,), dtype=np.float32)
@@ -167,21 +181,23 @@ if __name__ == '__main__':
             return deck
 
         def __getitem__(self, item):
-            x, y = self.generator.__getitem__(item)
-            chosen_indices = np.random.choice(self.num_decks, size=len(x), replace=False)
-            deck_x_tensor = np.stack([self.get_one_hot(self.decks[deck_index]['main'])
-                                      + self.get_one_hot(self.decks[deck_index]['side']) for deck_index in chosen_indices])
-            deck_y_tensor = np.stack([self.get_one_hot(self.decks[deck_index]['main']) for deck_index in chosen_indices])
-            return (
-                ((tf.sparse.from_dense(x), 0), (tf.sparse.from_dense(deck_x_tensor), 1)),
-                (y, deck_y_tensor),
-            )
+            if item % 2 == 0:
+                x, y = self.generator.__getitem__(item)
+                return (x, tf.convert_to_tensor(0, dtype=tf.int32)), np.clip(y, 0, 1)
+            else:
+                chosen_indices = np.random.choice(self.num_decks, size=self.batch_size, replace=False)
+                deck_x_tensor = np.stack([self.get_one_hot(self.decks[deck_index]['main'])
+                                          + self.get_one_hot(self.decks[deck_index]['side']) for deck_index in chosen_indices])
+                deck_y_tensor = np.stack([self.get_one_hot(self.decks[deck_index]['main'], max_one=True) for deck_index in chosen_indices])
+                return (deck_x_tensor, tf.convert_to_tensor(1, dtype=tf.int32)), np.clip(deck_y_tensor, 0, 1)
 
         def __len__(self):
-            return len(self.generator)
+            return 2 * len(self.generator)
 
     print(f'Loading metapath adjacency_matrices')
-    card_metapaths = [np.load(filename) for filename in tqdm(list((data / 'adjs').iterdir()))]
+    card_metapaths = [np.load(filename).astype(np.float32) for filename in tqdm(list((data / 'adjs').iterdir()))]
+    sum_card_metapaths = len(card_metapaths) / max(np.sum(mp) for mp in card_metapaths)
+    card_metapaths = [mp / np.amax(mp) for mp in card_metapaths]
 
     print(f'Creating a pool with {args.num_workers} different workers.')
     generator = GeneratorWithoutAdj(
@@ -201,11 +217,11 @@ if __name__ == '__main__':
         cube_id_to_index = {}
         decks = utils.build_deck_with_sides(decks_folder, cube_id_to_index,
                                             lambda deck: len(deck['side']) > 5 and 23 <= len(deck['main']) <= 60)
-        wrapped = GeneratorWrapper(generator, decks=decks, num_cards=num_cards)
+        wrapped = GeneratorWrapper(generator, decks=decks, num_cards=num_cards, batch_size=args.batch_size)
 
         print('Setting Up Model . . . \n')
         checkpoint_dir = output / 'checkpoint'
-        recommender = MetapathRecommender(num_cards=num_cards, card_metapaths=card_metapaths,
+        recommender = MetapathRecommender(card_metapaths=card_metapaths,
                                           embed_dims=args.embed_dims, metapath_dims=args.metapath_dims,
                                           num_heads=args.num_heads, attention_dropout=args.attention_dropout,
                                           embedding_initializer=args.embedding_initializer,
@@ -213,6 +229,7 @@ if __name__ == '__main__':
                                           attention_kernel_initializer=args.attention_kernel_initializer,
                                           pool_kernel_initializer=args.pool_kernel_initializer,
                                           metapath_activation=args.metapath_activation,
+                                          jit_scope=jit_scope,
                                           name='MetapathRecommender')
         del card_metapaths
 
@@ -224,7 +241,8 @@ if __name__ == '__main__':
         THRESHOLDS=[0.1, 0.25, 0.5, 0.75, 0.9]
         recommender.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=args.learning_rate),
-            loss=tf.keras.losses.BinaryCrossentropy(name='cube_loss'),
+            loss=(tf.keras.losses.BinaryCrossentropy(name='cube_loss'),),
+                  # tf.keras.losses.BinaryCrossentropy(name='deck_loss')),
             metrics=[
                 (
                     *[tf.keras.metrics.Recall(t, name=f'cube_recall_{t}') for t in THRESHOLDS],
@@ -232,6 +250,12 @@ if __name__ == '__main__':
                     *[tf.keras.metrics.RecallAtPrecision(t, name=f'cube_recall_at_precision_{t}') for t in THRESHOLDS],
                     *[tf.keras.metrics.Precision(t, name=f'cube_precision_{t}') for t in THRESHOLDS],
                 ),
+                # (
+                #     *[tf.keras.metrics.Recall(t, name=f'deck_recall_{t}') for t in THRESHOLDS],
+                #     *[tf.keras.metrics.PrecisionAtRecall(t, name=f'deck_precision_at_recall_{t}') for t in THRESHOLDS],
+                #     *[tf.keras.metrics.RecallAtPrecision(t, name=f'deck_recall_at_precision_{t}') for t in THRESHOLDS],
+                #     *[tf.keras.metrics.Precision(t, name=f'deck_precision_{t}') for t in THRESHOLDS],
+                # ),
             ],
             from_serialized=True,
         )
@@ -254,10 +278,10 @@ if __name__ == '__main__':
                                                            min_lr=1 / (2 ** 20),
                                                            verbose=True)
         tb_callback = TensorBoardFix(log_dir=log_dir, histogram_freq=1, write_graph=True,
-                                     update_freq=num_cubes // 10 // num_cubes,
+                                     update_freq=num_cubes // 10 // args.batch_size,
                                      profile_batch=0 if not args.profile
-                                     else (int(1.4 * num_cubes / num_cubes),
-                                           int(1.6 * num_cubes / num_cubes)))
+                                     else (int(1.4 * num_cubes / args.batch_size),
+                                           int(1.6 * num_cubes / args.batch_size)))
         tqdm_callback = TqdmCallback(epochs=args.epochs, data_size=len(wrapped) * args.batch_size,
                                      batch_size=args.batch_size, dynamic_ncols=True)
         callbacks.append(mcp_callback)

@@ -108,17 +108,19 @@ SEED_PATHS = (
 # )
 CARD_TO_CARD_PATHS = (
     ('in_cube_trans', 'in_cube'),
-    ('in_cube_trans', 'from_cube_trans', 'in_main'),
+    # ('in_cube_trans', 'from_cube_trans', 'in_main'),
     # ('in_cube_trans', 'from_cube_trans', 'in_side'),
 
-    ('in_main_trans', 'in_main'),
+    ('in_main_trans', 'in_pool'),
+    # ('in_main_trans', 'in_main'),
     # ('in_main_trans', 'in_side'),
-    ('in_main_trans', 'from_cube', 'in_cube'),
+    # ('in_main_trans', 'from_cube', 'in_cube'),
     # ('in_main_trans', 'from_cube', 'from_cube_trans', 'in_main'),
     # ('in_main_trans', 'from_cube', 'from_cube_trans', 'in_side'),
 
+    ('in_side_trans', 'in_pool'),
     # ('in_side_trans', 'in_main'),
-    ('in_side_trans', 'in_side'),
+    # ('in_side_trans', 'in_side'),
     # ('in_side_trans', 'from_cube', 'in_cube'),
     # ('in_side_trans', 'from_cube', 'from_cube_trans', 'in_main'),
     # ('in_side_trans', 'from_cube', 'from_cube_trans', 'in_side'),
@@ -128,6 +130,7 @@ CARD_TO_CARD_PATHS = (
     # ('in_pool_trans', 'from_cube', 'in_cube'),
     # ('in_pool_trans', 'from_cube', 'from_cube_trans', 'in_main'),
     # ('in_pool_trans', 'from_cube', 'from_cube_trans', 'in_side'),
+    ('card_id',),
 )
 
 
@@ -169,6 +172,7 @@ if __name__ == "__main__":
         ('in_side',): in_side_adj, # deck -> card
         ('in_pool',): in_pool_adj, # deck -> card
         ('from_cube',): from_cube_adj, # deck -> cube
+        ('card_id',): sp.identity(num_cards),
     }
 
     print('Getting metapath adjs')
