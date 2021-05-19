@@ -22,7 +22,7 @@ BAD_FUNCTIONS = [
 ]
 
 
-def get_exclusions(card_file=None):
+def get_exclusions(card_to_int, card_file=None):
     exclusions = list(BAD_NAMES)
     if card_file is None:
         return frozenset(exclusions)
@@ -31,7 +31,9 @@ def get_exclusions(card_file=None):
     for cd in card_dict.values():
         for bf in BAD_FUNCTIONS:
             if cd.get('name_lower') not in exclusions and bf(cd):
-                exclusions.append(cd.get('name_lower'))
+                card_id = card_to_int.get(cd.get('name_lower', '-1'), None)
+                if card_id is not None:
+                    exclusions.append(card_id)
     return frozenset(exclusions)
 
 
@@ -66,7 +68,7 @@ def get_num_objs(cube_folder, validation_func=lambda _: True):
     return num_objs
 
 
-def build_cubes(cube_folder, num_cubes, num_cards, card_to_int,
+def build_cubes(cube_folder, num_cubes, num_cards,
                 validation_func=lambda _: True, exclusions=frozenset()):
     cubes = np.zeros((num_cubes, num_cards))
     counter = 0
@@ -77,18 +79,16 @@ def build_cubes(cube_folder, num_cubes, num_cards, card_to_int,
             for cube in contents:
                 if validation_func(cube):
                     card_ids = []
-                    for card_name in cube['cards']:
-                        if card_name is not None and card_name not in exclusions:
-                            card_id = card_to_int.get(card_name, None)
-                            if card_id is not None:
-                                card_ids.append(card_id)
+                    for card_id in cube['cards']:
+                        if card_id is not None and card_id not in exclusions:
+                            card_ids.append(card_id)
                     cubes[counter, card_ids] = 1
                     counter += 1
                     tqdm_bar.update(1)
     return cubes
 
 
-def build_sparse_cubes(cube_folder, card_to_int, validation_func=lambda _: True, exclusions=frozenset()):
+def build_sparse_cubes(cube_folder, validation_func=lambda _: True, exclusions=frozenset()):
     cubes = []
     cube_ids = []
     num_cubes = get_num_objs(cube_folder, validation_func)
@@ -99,11 +99,9 @@ def build_sparse_cubes(cube_folder, card_to_int, validation_func=lambda _: True,
             for cube in contents:
                 if validation_func(cube):
                     card_ids = []
-                    for card_name in cube['cards']:
-                        if card_name is not None and card_name not in exclusions:
-                            card_id = card_to_int.get(card_name, None)
-                            if card_id is not None:
-                                card_ids.append(card_id)
+                    for card_id in cube['cards']:
+                        if card_id is not None and card_id not in exclusions:
+                            card_ids.append(card_id)
                     if len(card_ids) > 0:
                         cubes.append(card_ids)
                         cube_ids.append(cube['id'])
@@ -112,7 +110,7 @@ def build_sparse_cubes(cube_folder, card_to_int, validation_func=lambda _: True,
 
 
 def build_decks(deck_folder, num_decks, num_cards,
-                card_to_int, validation_func=lambda _: True,
+                validation_func=lambda _: True,
                 soft_validation=0, exclusions=frozenset()):
     decks = np.zeros((num_decks, num_cards), dtype=np.uint8)
     counter = 0
@@ -123,11 +121,9 @@ def build_decks(deck_folder, num_decks, num_cards,
             for deck in contents:
                 if soft_validation > 0 or validation_func(deck):
                     card_ids = []
-                    for card_name in deck['main']:
-                        if card_name is not None and card_name not in exclusions:
-                            card_id = card_to_int.get(card_name, None)
-                            if card_id is not None:
-                                card_ids.append(card_id)
+                    for card_id in deck['main']:
+                        if card_id is not None and card_id not in exclusions:
+                            card_ids.append(card_id)
                     weight = 1
                     if not validation_func(deck):
                         weight = soft_validation
@@ -137,12 +133,12 @@ def build_decks(deck_folder, num_decks, num_cards,
     return decks
 
 
-def build_deck_with_sides(deck_folder, card_to_int, cube_id_to_index, validation_func=lambda _: True,
+def build_deck_with_sides(deck_folder, cube_id_to_index, validation_func=lambda _: True,
                           exclusions=frozenset()):
     decks = []
     counter = 0
     num_decks = get_num_objs(deck_folder, validation_func)
-    with tqdm(total=num_cubes, unit='cube', dynamic_ncols=True, unit_scale=True) as tqdm_bar:
+    with tqdm(total=num_decks, unit='deck', dynamic_ncols=True, unit_scale=True) as tqdm_bar:
         for filename in tqdm(list(deck_folder.iterdir()), dynamic_ncols=True, unit='file'):
             with open(filename, 'rb') as deck_file:
                 contents = json.load(deck_file)
@@ -150,23 +146,19 @@ def build_deck_with_sides(deck_folder, card_to_int, cube_id_to_index, validation
                 if validation_func(deck):
                     main = []
                     side = []
-                    for card_name in deck['main']:
-                        if card_name is not None and card_name not in exclusions:
-                            card_id = card_to_int.get(card_name, None)
-                            if card_id is not None:
-                                main.append(card_id)
-                    for card_name in deck['side']:
-                        if card_name is not None and card_name not in exclusions:
-                            card_id = card_to_int.get(card_name, None)
-                            if card_id is not None:
-                                side.append(card_id)
+                    for card_id in deck['main']:
+                        if card_id is not None and card_id not in exclusions:
+                            main.append(card_id)
+                    for card_id in deck['side']:
+                        if card_id is not None and card_id not in exclusions:
+                            side.append(card_id)
                     decks.append({'main': main, 'side': side, 'cube': cube_id_to_index.get(deck['cubeid'], None)})
                     tqdm_bar.update(1)
     return decks
 
 
 def build_mtx(deck_folder, num_cards,
-              card_to_int, validation_func=lambda _: True,
+              validation_func=lambda _: True,
               soft_validation=0):
     adj_mtx = np.zeros((num_cards, num_cards), dtype=np.uint32)
     counter = 0
@@ -176,11 +168,9 @@ def build_mtx(deck_folder, num_cards,
         for deck in tqdm(contents, unit='deck', unit_scale=True, dynamic_ncols=True, initial=counter, leave=None):
             if soft_validation > 0 or validation_func(deck):
                 card_ids = []
-                for card_name in deck['main']:
-                    if card_name is not None:
-                        card_id = card_to_int.get(card_name, None)
-                        if card_id is not None:
-                            card_ids.append(card_id)
+                for card_id in deck['main']:
+                    if card_id is not None:
+                        card_ids.append(card_id)
                 weight = 1 if validation_func(deck) else 0
                 if not validation_func(deck):
                     weight = soft_validation

@@ -20,11 +20,11 @@ if __name__ == '__main__':
     num_decks = 0
     with open(int_to_card_filepath, 'rb') as int_to_card_file:
         int_to_card = json.load(int_to_card_file)
-    card_to_int = {v: i for i, v in enumerate(int_to_card)}
     num_cards = len(int_to_card)
+    card_to_int = {v: i for i, v in enumerate(int_to_card)}
 
-    adj_mtx = utils.build_mtx(decks_folder, len(int_to_card),
-                              card_to_int, validation_func=is_valid_deck,
+    adj_mtx = utils.build_mtx(decks_folder, num_cards,
+                              validation_func=is_valid_deck,
                               soft_validation=0)
 
 
