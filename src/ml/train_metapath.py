@@ -5,6 +5,7 @@ import random
 from datetime import datetime
 from pathlib import Path
 
+import scipy.sparse as sp
 from tqdm.auto import tqdm
 from tqdm.keras import TqdmCallback
 
@@ -38,15 +39,15 @@ if __name__ == '__main__':
     parser.add_argument('--embed-dims', type=int, default=128, choices=[2**i for i in range(0, 12)], help='The number of dimensions for the card ebeddings.')
     parser.add_argument('--metapath-dims', type=int, default=64, choices=[2**i for i in range(0, 10)], help='The number of dimensions for the metapath specific views of the pool embeddings.')
     parser.add_argument('--num-heads', type=int, default=16, choices=[2**i for i in range(0, 9)], help='The number of attention heads to use for combining the metapaths.')
-    parser.add_argument('--embedding-initializer', type=str, default='glorot_uniform', help='The initializer for the card embeddings, value can be any supported by keras.')
-    parser.add_argument('--metapath-kernel-initializer', type=str, default='glorot_uniform', help='The initializer for the metapath transformation, value can be any supported by keras.')
-    parser.add_argument('--metapath-activation', type=str, default='swish', help='The activation function for mapping to the metapath specific views of cards. Value can be any supported by keras.')
-    parser.add_argument('--attention-kernel-initializer', type=str, default='glorot_uniform', help='The initializer for the kernel transformation, value can be any supported by keras.')
-    parser.add_argument('--pool-kernel-initializer', type=str, default='glorot_uniform', help='The initializer for the transformation back to a pool embedding, value can be any supported by keras.')
-    parser.add_argument('--attention-dropout', type=float, default=0.2, help='The percentage of dropout in the attention layer over paths, only applies for training.')
+    parser.add_argument('--dropout', type=float, default=0.2, help='The percentage of dropout in the attention layer over paths, only applies for training.')
+    parser.add_argument('--margin', type=float, default=1.0, help='The margin to use for scaling things away from -1.')
     parser.add_argument('--name', '-n', '-o', type=str, help='The folder under ml_files to save the model in.')
     parser.add_argument('--noise', type=float, default=0.5, help='The mean number of random swaps to make per cube.')
     parser.add_argument('--noise-stddev', type=float, default=0.1, help="The standard deviation of the amount of noise to apply.")
+    parser.add_argument('--decks-weight', type=float, default=1.0, help="The relative weight of rebuilding decks to reconstructing cubes.")
+    parser.add_argument('--l1-weight', type=float, default=0.1, help="The relative weight of the l1 regularization to the cube reconstruction.")
+    parser.add_argument('--l2-weight', type=float, default=0.5, help="The relative weight of the l2 regularization to the cube reconstruction.")
+    parser.add_argument('--plateau-patience', type=int, default=32, help='The number of epochs without improvement before halving the learning rate.')
     parser.add_argument('--learning-rate', type=float, default=1e-04, help="The initial learning rate.")
     parser.add_argument('--seed', type=int, default=37, help="A random seed to provide reproducible runs.")
     parser.add_argument('--profile', action='store_true', help='Run profiling on part of the second batch to analyze performance.')
@@ -81,7 +82,7 @@ if __name__ == '__main__':
         adj_mtx = np.load('data/adj_mtx.npy')
         return adj_mtx
 
-    print('Loading card data and cube counts.')
+    print('Loading card data and number of cubes.')
     with open(int_to_card_filepath, 'rb') as int_to_card_file:
         int_to_card = json.load(int_to_card_file)
     card_to_int = {v: i for i, v in enumerate(int_to_card)}
@@ -181,25 +182,23 @@ if __name__ == '__main__':
             return deck
 
         def __getitem__(self, item):
-            if item % 2 == 0:
-                x, y = self.generator.__getitem__(item)
-                return (x, tf.convert_to_tensor(0, dtype=tf.int32)), np.clip(y, 0, 1)
-            else:
-                chosen_indices = np.random.choice(self.num_decks, size=self.batch_size, replace=False)
-                deck_x_tensor = np.stack([self.get_one_hot(self.decks[deck_index]['main'])
-                                          + self.get_one_hot(self.decks[deck_index]['side']) for deck_index in chosen_indices])
-                deck_y_tensor = np.stack([self.get_one_hot(self.decks[deck_index]['main'], max_one=True) for deck_index in chosen_indices])
-                return (deck_x_tensor, tf.convert_to_tensor(1, dtype=tf.int32)), np.clip(deck_y_tensor, 0, 1)
+            x, y = self.generator.__getitem__(item)
+            chosen_indices = np.random.choice(self.num_decks, size=self.batch_size, replace=False)
+            deck_x_tensor = np.stack([self.get_one_hot(self.decks[deck_index]['main'])
+                                      + self.get_one_hot(self.decks[deck_index]['side']) for deck_index in chosen_indices])
+            deck_y_tensor = np.stack([self.get_one_hot(self.decks[deck_index]['main'], max_one=True) for deck_index in chosen_indices])
+            return (
+                (x, deck_x_tensor),
+                (np.clip(y, 0, 1), np.clip(deck_y_tensor, 0, 1)),
+            )
 
         def __len__(self):
-            return 2 * len(self.generator)
+            return len(self.generator)
 
-    print(f'Loading metapath adjacency_matrices')
-    card_metapaths = [np.load(filename).astype(np.float32) for filename in tqdm(list((data / 'adjs').iterdir()))]
-    sum_card_metapaths = len(card_metapaths) / max(np.sum(mp) for mp in card_metapaths)
-    card_metapaths = [mp / np.amax(mp) for mp in card_metapaths]
+    def load_metapaths():
+        print(f'Loading metapath adjacency matrices')
+        return tuple(sp.load_npz(filename).tocoo() / 1024 for filename in tqdm(list((data / 'adjs').iterdir())))
 
-    print(f'Creating a pool with {args.num_workers} different workers.')
     generator = GeneratorWithoutAdj(
         load_adj_mtx(),
         load_cubes(),
@@ -210,71 +209,72 @@ if __name__ == '__main__':
         args.noise_stddev,
     )
 
+    print(f'Creating a pool with {args.num_workers} different workers.')
     with generator:
-        print('Setting up graph and lookup tables')
+        print('Loading decks with sideboards.')
         # cubes, cube_ids = utils.build_sparse_cubes(cube_folder, is_valid_cube)
         # cube_id_to_index = {v: i for i, v in enumerate(cube_ids)}
         cube_id_to_index = {}
-        decks = utils.build_deck_with_sides(decks_folder, cube_id_to_index,
-                                            lambda deck: len(deck['side']) > 5 and 23 <= len(deck['main']) <= 60)
-        wrapped = GeneratorWrapper(generator, decks=decks, num_cards=num_cards, batch_size=args.batch_size)
+        wrapped = GeneratorWrapper(
+            generator, num_cards=num_cards, batch_size=args.batch_size,
+            decks=utils.build_deck_with_sides(decks_folder, cube_id_to_index,
+                                              lambda deck: len(deck['side']) > 5 and 23 <= len(deck['main']) <= 60)
+        )
 
         print('Setting Up Model . . . \n')
         checkpoint_dir = output / 'checkpoint'
-        recommender = MetapathRecommender(card_metapaths=card_metapaths,
-                                          embed_dims=args.embed_dims, metapath_dims=args.metapath_dims,
-                                          num_heads=args.num_heads, attention_dropout=args.attention_dropout,
-                                          embedding_initializer=args.embedding_initializer,
-                                          metapath_kernel_initializer=args.metapath_kernel_initializer,
-                                          attention_kernel_initializer=args.attention_kernel_initializer,
-                                          pool_kernel_initializer=args.pool_kernel_initializer,
-                                          metapath_activation=args.metapath_activation,
-                                          jit_scope=jit_scope,
-                                          name='MetapathRecommender')
-        del card_metapaths
+        THRESHOLDS=[0.1, 0.25, 0.5, 0.75, 0.9]
+        recommender = MetapathRecommender(
+            card_metapaths=load_metapaths(), embed_dims=args.embed_dims, l1_weight=args.l1_weight,
+            metapath_dims=args.metapath_dims, num_heads=args.num_heads, dropout=args.dropout,
+            margin=args.margin, decks_weight=args.decks_weight, l2_weight=args.l2_weight,
+            jit_scope=jit_scope,
+            cube_metrics=[
+                *[tf.keras.metrics.Recall(t, name=f'cube_recall_{t}') for t in THRESHOLDS],
+                *[tf.keras.metrics.PrecisionAtRecall(t, name=f'cube_precision_at_recall_{t}') for t in THRESHOLDS],
+                *[tf.keras.metrics.RecallAtPrecision(t, name=f'cube_recall_at_precision_{t}') for t in THRESHOLDS],
+                *[tf.keras.metrics.Precision(t, name=f'cube_precision_{t}') for t in THRESHOLDS],
+            ],
+            deck_metrics=[
+                *[tf.keras.metrics.Recall(t, name=f'deck_recall_{t}') for t in THRESHOLDS],
+                *[tf.keras.metrics.PrecisionAtRecall(t, name=f'deck_precision_at_recall_{t}') for t in THRESHOLDS],
+                *[tf.keras.metrics.RecallAtPrecision(t, name=f'deck_recall_at_precision_{t}') for t in THRESHOLDS],
+                *[tf.keras.metrics.Precision(t, name=f'deck_precision_{t}') for t in THRESHOLDS],
+            ],
+            name='MetapathRecommender')
 
 
+        output.mkdir(exist_ok=True, parents=True)
         latest = tf.train.latest_checkpoint(str(output))
         if latest is not None:
             print('Loading Checkpoint. Saved values are:')
             recommender.load_weights(latest)
-        THRESHOLDS=[0.1, 0.25, 0.5, 0.75, 0.9]
+        else:
+            with open(output / 'int_to_card.json', 'w') as int_to_card_file:
+                json.dump(int_to_card, int_to_card_file)
+            with open(output / 'args.json', 'w') as args_file:
+                json.dump(args.__dict__, args_file, indent=2)
         recommender.compile(
             optimizer=tf.keras.optimizers.Adam(learning_rate=args.learning_rate),
-            loss=(tf.keras.losses.BinaryCrossentropy(name='cube_loss'),),
-                  # tf.keras.losses.BinaryCrossentropy(name='deck_loss')),
-            metrics=[
-                (
-                    *[tf.keras.metrics.Recall(t, name=f'cube_recall_{t}') for t in THRESHOLDS],
-                    *[tf.keras.metrics.PrecisionAtRecall(t, name=f'cube_precision_at_recall_{t}') for t in THRESHOLDS],
-                    *[tf.keras.metrics.RecallAtPrecision(t, name=f'cube_recall_at_precision_{t}') for t in THRESHOLDS],
-                    *[tf.keras.metrics.Precision(t, name=f'cube_precision_{t}') for t in THRESHOLDS],
-                ),
-                # (
-                #     *[tf.keras.metrics.Recall(t, name=f'deck_recall_{t}') for t in THRESHOLDS],
-                #     *[tf.keras.metrics.PrecisionAtRecall(t, name=f'deck_precision_at_recall_{t}') for t in THRESHOLDS],
-                #     *[tf.keras.metrics.RecallAtPrecision(t, name=f'deck_recall_at_precision_{t}') for t in THRESHOLDS],
-                #     *[tf.keras.metrics.Precision(t, name=f'deck_precision_{t}') for t in THRESHOLDS],
-                # ),
-            ],
-            from_serialized=True,
         )
 
         print('Starting training')
-        output.mkdir(exist_ok=True, parents=True)
         callbacks = []
         mcp_callback = tf.keras.callbacks.ModelCheckpoint(
             filepath=checkpoint_dir,
             monitor='loss',
             verbose=False,
             save_best_only=False,
+            save_weights_only=True,
             mode='min',
             save_freq='epoch')
         nan_callback = tf.keras.callbacks.TerminateOnNaN()
         es_callback = tf.keras.callbacks.EarlyStopping(monitor='loss', patience=64,
                                                        mode='min', restore_best_weights=True, verbose=True)
         lr_callback = tf.keras.callbacks.ReduceLROnPlateau(monitor='loss', factor=0.5, mode='min',
-                                                           patience=32, min_delta=1 / (2 ** 14), cooldown=16,
+                                                           patience=args.plateau_patience,
+                                                           cooldown=args.plateau_patience // 4,
+                                                           min_delta=1 / (2 ** 14),
                                                            min_lr=1 / (2 ** 20),
                                                            verbose=True)
         tb_callback = TensorBoardFix(log_dir=log_dir, histogram_freq=1, write_graph=True,

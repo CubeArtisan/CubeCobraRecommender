@@ -26,8 +26,9 @@ def build_sparse_adj(objs, num_rows, num_cols):
     values = np.int32(list(lookup[1]))
     rows = np.int32([key[0] for key in lookup[0]])
     cols = np.int32([key[1] for key in lookup[0]])
-    mat = sp.csr_matrix((values, (rows, cols)), shape=(num_rows, num_cols))
+    mat = sp.csr_matrix((values, (rows, cols)), shape=(num_rows, num_cols)).astype(np.float32)
     mat.sort_indices()
+    mat.eliminate_zeros()
     mat.prune()
     return mat
 
@@ -108,21 +109,21 @@ SEED_PATHS = (
 # )
 CARD_TO_CARD_PATHS = (
     ('in_cube_trans', 'in_cube'),
-    # ('in_cube_trans', 'from_cube_trans', 'in_main'),
+    ('in_cube_trans', 'from_cube_trans', 'in_main'),
     # ('in_cube_trans', 'from_cube_trans', 'in_side'),
 
     ('in_main_trans', 'in_pool'),
-    # ('in_main_trans', 'in_main'),
+    ('in_main_trans', 'in_main'),
     # ('in_main_trans', 'in_side'),
     # ('in_main_trans', 'from_cube', 'in_cube'),
     # ('in_main_trans', 'from_cube', 'from_cube_trans', 'in_main'),
     # ('in_main_trans', 'from_cube', 'from_cube_trans', 'in_side'),
 
     ('in_side_trans', 'in_pool'),
-    # ('in_side_trans', 'in_main'),
+    ('in_side_trans', 'in_main'),
     # ('in_side_trans', 'in_side'),
     # ('in_side_trans', 'from_cube', 'in_cube'),
-    # ('in_side_trans', 'from_cube', 'from_cube_trans', 'in_main'),
+    ('in_side_trans', 'from_cube', 'from_cube_trans', 'in_main'),
     # ('in_side_trans', 'from_cube', 'from_cube_trans', 'in_side'),
 
     # ('in_pool_trans', 'in_main'),
@@ -185,8 +186,10 @@ if __name__ == "__main__":
     total_nnz = 0
     for path in tqdm(save_paths, dynamic_ncols=True, unit='matrix'):
         filename = adjs_dir / '-'.join(path)
-        adj = adjs[path]
+        adj = adjs[path] * (1024 / adjs[path].max())
+        adj.eliminate_zeros()
         print(f'With {adj.nnz:09,} elements we have a density of {adj.nnz/adj.shape[0]/adj.shape[1]:06.2%} for path {path}.')
         total_nnz += adj.nnz
-        np.save(filename, adj.toarray())
+        sp.save_npz(filename, adj)
+        # np.save(filename, adj.toarray())
     print(f'We have a total of {total_nnz:010,} elements for a density of {total_nnz/num_cards/num_cards/len(save_paths):06.2%}.')
