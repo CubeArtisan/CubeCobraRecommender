@@ -8,18 +8,18 @@ import tensorflow as tf
 import tensorflow_addons as tfa
 
 
-def convert_spmatrix_to_sparsetensor(coo: sp.coo_matrix, dtype=tf.float32) -> tf.SparseTensor:
+def convert_spmatrix_to_sparsetensor(coo, dtype=tf.float32):
     indices = np.mat([coo.row, coo.col]).transpose()
     return tf.sparse.reorder(tf.SparseTensor(indices, tf.convert_to_tensor(coo.data, dtype=dtype), coo.shape))
 
 
 class MetapathEmbed(tf.keras.layers.Layer):
-    def __init__(self, metapath_dims: int, use_sparse=False, l1_weight=0.0, l2_weight=0.005,
-                 jit_scope=contextlib.nullcontext, **kwargs):
+    def __init__(self, metapath_dims, use_sparse=False, jit_scope=contextlib.nullcontext, **kwargs):
         super(MetapathEmbed, self).__init__(**kwargs)
         self.metapath_dims = metapath_dims
         self.use_sparse = use_sparse
-        self.map_embeddings = tf.keras.layers.Dense(metapath_dims, activation='swish', name=f'{self.name}/map_card_embeddings')
+        self.map_embeddings = tf.keras.layers.Dense(metapath_dims, activation='swish', use_bias=True,
+                                                    name=f'{self.name}/map_card_embeddings')
         self.jit_scope = jit_scope
         # self.activity_regularizer = tf.keras.regularizers.l1_l2(l1=l1_weight, l2=l2_weight)
 
@@ -30,7 +30,7 @@ class MetapathEmbed(tf.keras.layers.Layer):
     #     }
 
     @tf.function()
-    def call(self, inputs: tuple[tf.SparseTensor, Union[tf.SparseTensor, tf.Tensor], tf.Tensor]):
+    def call(self, inputs):
         with self.jit_scope():
             batch_pools, metapath, card_embeddings = inputs
             transformed_embeddings = self.map_embeddings(card_embeddings)
@@ -42,8 +42,8 @@ class MetapathEmbed(tf.keras.layers.Layer):
 
 
 class EmbedSet(tf.keras.layers.Layer):
-    def __init__(self, use_sparses: tuple[bool, ...], embed_dims: int, metapath_dims: int, num_heads: int,
-                 dropout: float = 0.0, margin=1.0, l1_weight=0.0, l2_weight=0.001,
+    def __init__(self, use_sparses, embed_dims, metapath_dims, num_heads,
+                 dropout=0.0, margin=1.0, l1_weight=0.0, l2_weight=0.001,
                  jit_scope=contextlib.nullcontext, **kwargs):
         assert metapath_dims >= num_heads > 0 and metapath_dims % num_heads == 0, 'num_heads must divide metapath_dims.'
         super(EmbedSet, self).__init__(**kwargs)
@@ -55,14 +55,13 @@ class EmbedSet(tf.keras.layers.Layer):
         self.margin = margin
         self.jit_scope = jit_scope
         self.metapath_layers = tuple(MetapathEmbed(metapath_dims=metapath_dims, use_sparse=use_sparse,
-                                                   l1_weight=l1_weight, l2_weight=l2_weight, dynamic=False,
+                                                   dynamic=False,
                                                    jit_scope=jit_scope, name=f'{self.name}/metapath_{i}')
                                      for i, use_sparse in enumerate(use_sparses))
         self.metapath_attention = tf.keras.layers.MultiHeadAttention(num_heads, metapath_dims // num_heads,
-                                                                     dropout=dropout,
-                                                                     use_bias=True, bias_initializer='zeros',
+                                                                     dropout=dropout, use_bias=False,
                                                                      name=f'{self.name}/metapath_attention')
-        self.embed_projection = tf.keras.layers.Dense(metapath_dims, activation='linear', use_bias=True,
+        self.embed_projection = tf.keras.layers.Dense(metapath_dims, activation='linear', use_bias=False,
                                                       name=f'{self.name}/embed_projection')
 
     # def get_config(self):
@@ -76,8 +75,7 @@ class EmbedSet(tf.keras.layers.Layer):
     #     }
 
     @tf.function()
-    def call(self, inputs: tuple[tf.SparseTensor, tuple[Union[tf.SparseTensor, tf.Tensor], ...], tf.Tensor],
-             training=False):
+    def call(self, inputs, training=False):
         with self.jit_scope():
             pools, metapaths, card_embeddings = inputs
             path_embeds = tf.stack([layer((pools, metapath, card_embeddings), training=training)
@@ -85,29 +83,19 @@ class EmbedSet(tf.keras.layers.Layer):
                                    axis=1, name=f'{self.name}/path_embeds')
             attended_embeds = tf.reduce_sum(self.metapath_attention(path_embeds, path_embeds, training=training),
                                              axis=1, name=f'{self.name}/attended_path_embeds')
-            # pool_embeds = tf.math.l2_normalize(attended_embeds, axis=1, name=f'{self.name}/pool_embeds')
             pool_embeds = attended_embeds
-            # projected_cards = tf.math.l2_normalize(self.embed_projection(card_embeddings),
-            #                                        axis=1, name=f'{self.name}/projected_cards')
-            projected_cards = self.embed_projection(card_embeddings, training=training)
+            projected_cards = tf.math.l2_normalize(self.embed_projection(card_embeddings, training=training), name='projected_cards')
             similarities = tf.einsum('be,ce->bc', pool_embeds, projected_cards, name=f'{self.name}/pool_similarities')
-            # return tf.cast((similarities + self.margin) / (1 + self.margin), dtype=tf.float32)
-            # return tf.nn.sigmoid(similarities)
             return similarities
 
 
 class MetapathRecommender(tf.keras.Model):
-    def __init__(self, card_metapaths: tuple[sp.spmatrix, ...],
+    def __init__(self, card_metapaths,
                  embed_dims=128, metapath_dims=64, num_heads=16, dropout=0.0, margin=1.0,
                  decks_weight = 1.0, jit_scope=contextlib.nullcontext, cube_metrics=[],
                  deck_metrics=[], l1_weight=0.01, l2_weight=0.1, **kwargs):
-        num_cards = card_metapaths[0].shape[0]
-        # inputs = (
-        #     tf.keras.Input(shape=(num_cards,), sparse=True),
-        #     tf.keras.Input(shape=(num_cards,), sparse=True),
-        # )
-        # super(MetapathRecommender, self).__init__(inputs=inputs, **kwargs)
         super(MetapathRecommender, self).__init__(**kwargs)
+        num_cards = card_metapaths[0].shape[0]
         # self.card_metapaths = card_metapaths
         # self.embed_dims = embed_dims
         # self.metapath_dims = metapath_dims
@@ -154,7 +142,7 @@ class MetapathRecommender(tf.keras.Model):
     #     }
 
     @tf.function()
-    def call(self, inputs: tuple[tf.SparseTensor, tf.SparseTensor], training=False):
+    def call(self, inputs, training=False):
         cubes, decks = inputs
         decks_mask = decks > 0
         cubes = cubes / tf.reduce_sum(tf.minimum(cubes, 1), axis=1, keepdims=True)
@@ -179,8 +167,8 @@ class MetapathRecommender(tf.keras.Model):
                 cube_loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(cubes_true, cubes_pred, from_logits=True))
                 flat_decks_pred = tf.boolean_mask(tf.reshape(decks_pred, (-1,)), flat_decks_mask, name='masked_deck_pred')
                 deck_loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(flat_decks_true, flat_decks_pred, from_logits=True))
-                l1_regularization = tf.reduce_mean(tf.norm(tf.cast(self.card_embeddings, dtype=cube_loss.dtype), ord=1, axis=1))
-                l2_regularization = tf.reduce_mean(tf.norm(tf.cast(self.card_embeddings, dtype=cube_loss.dtype), ord=2, axis=1))
+                l1_regularization = tf.reduce_mean(tf.norm(self.card_embeddings, ord=1, axis=1))
+                l2_regularization = tf.reduce_mean(tf.norm(self.card_embeddings, ord=2, axis=1))
                 loss = cube_loss + self.decks_weight * deck_loss + self.l1_weight * l1_regularization\
                                  + self.l2_weight * l2_regularization
 
@@ -192,6 +180,7 @@ class MetapathRecommender(tf.keras.Model):
             self.loss_metric.update_state(loss)
             self.cube_loss_metric.update_state(cube_loss)
             self.deck_loss_metric.update_state(deck_loss)
+            self.l1_reg_metric.update_state(l1_regularization)
             self.l2_reg_metric.update_state(l2_regularization)
             cubes_prob = tf.nn.sigmoid(cubes_pred)
             for metric in self.cube_metrics:
@@ -199,17 +188,20 @@ class MetapathRecommender(tf.keras.Model):
             flat_decks_prob = tf.nn.sigmoid(flat_decks_pred)
             for metric in self.deck_metrics:
                 metric.update_state(flat_decks_true, flat_decks_prob)
-        return {
+        result = {
             'loss': self.loss_metric.result(),
             'cube_loss': self.cube_loss_metric.result(),
             'deck_loss': self.deck_loss_metric.result(),
             'l2_reg': self.l2_reg_metric.result(),
             'l1_reg': self.l1_reg_metric.result(),
-        } | {
-            metric.name: metric.result() for metric in self.cube_metrics
-        } | {
-            metric.name: metric.result() for metric in self.deck_metrics
         }
+        result.update({
+            metric.name: metric.result() for metric in self.cube_metrics
+        })
+        result.update({
+            metric.name: metric.result() for metric in self.deck_metrics
+        })
+        return result
 
     @property
     def metrics(self):

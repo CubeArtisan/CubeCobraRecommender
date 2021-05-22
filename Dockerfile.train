@@ -1,0 +1,16 @@
+FROM 763104351884.dkr.ecr.us-east-1.amazonaws.com/tensorflow-training:2.4.1-gpu-py37-cu110-ubuntu18.04
+
+RUN apt-get install gcc cmake
+RUN python --version
+RUN python -m pip install scikit-build
+
+RUN mkdir CubeCobraRecommender
+WORKDIR CubeCobraRecommender
+COPY pyproject.toml .
+COPY setup.py .
+COPY extern extern
+COPY src src
+COPY CMakeLists.txt .
+COPY cpp cpp
+RUN python setup.py install
+COPY data data

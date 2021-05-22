@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <numeric>
+#include <optional>
 #include <queue>
 #include <random>
 #include <thread>
@@ -22,7 +23,11 @@ std::valarray<std::size_t> sample_no_replacement(const std::size_t count, std::v
                                                  const std::vector<std::size_t>& actual_indices, pcg32& rng) {
     weights /= weights.sum();
     std::vector<double> cum_sum(weights.size());
-    std::inclusive_scan(std::begin(weights), std::end(weights), std::begin(cum_sum));
+    double cumulative = 0.0;
+    for (size_t i=0; i < weights.size(); i++) {
+        cumulative += weights[i];
+        cum_sum[i] = cumulative;
+    }
     std::priority_queue<std::pair<double, std::size_t>> reservoir;
     std::valarray<std::size_t> results(count);
     for (std::size_t i = 0; i < count; i++) reservoir.emplace(exp_dist(rng) / weights[i], i);
@@ -81,9 +86,9 @@ private:
     std::uniform_real_distribution<double> neg_sampler_rand;
     pcg32 main_rng;
 
-    std::vector<std::jthread> threads;
+    std::vector<std::thread> threads;
 
-    moodycamel::BlockingConcurrentQueue<std::vector<std::size_t>> task_queue;
+    moodycamel::BlockingConcurrentQueue<std::optional<std::vector<std::size_t>>> task_queue;
     moodycamel::ProducerToken task_producer;
     moodycamel::BlockingConcurrentQueue<queue_values> result_queue;
     moodycamel::ConsumerToken result_consumer;
@@ -118,17 +123,21 @@ public:
             if (count == 0) count = 1;
             sortable_sampler.emplace_back(count, i);
         }
-        std::ranges::sort(sortable_sampler, [](const auto& p1, const auto& p2) { return p1.first > p2.first; });
-        std::ranges::transform(sortable_sampler, std::begin(neg_sampler), [](const auto& p) { return p.first; });
-        std::ranges::transform(sortable_sampler, std::begin(true_indices), [](const auto& p) { return p.second; });
-        std::inclusive_scan(std::begin(neg_sampler), std::end(neg_sampler), std::begin(replacing_neg_sampler));
+        std::sort(sortable_sampler.begin(), sortable_sampler.end(), [](const auto& p1, const auto& p2) { return p1.first > p2.first; });
+        std::transform(sortable_sampler.begin(), sortable_sampler.end(), std::begin(neg_sampler), [](const auto& p) { return p.first; });
+        std::transform(sortable_sampler.begin(), sortable_sampler.end(), std::begin(true_indices), [](const auto& p) { return p.second; });
+        double cumulative = 0.0;
+        for (size_t i = 0; i < neg_sampler.size(); i++) {
+            cumulative += neg_sampler[i];
+            replacing_neg_sampler[i] = cumulative;
+        }
         neg_sampler_rand = std::uniform_real_distribution<double>(0, replacing_neg_sampler[num_cards - 1]);
     }
 
     Generator& enter() {
         py::gil_scoped_release release;
         for (size_t i=0; i < num_threads; i++) {
-            threads.emplace_back([i, this](std::stop_token st) { this->worker_thread(st, pcg32(this->initial_seed, i)); });
+            threads.emplace_back([i, this]() { this->worker_thread(pcg32(this->initial_seed, i)); });
         }
         main_rng = pcg32(initial_seed, num_threads);
         queue_new_epoch();
@@ -136,7 +145,8 @@ public:
     }
 
     bool exit(py::object, py::object, py::object) {
-        for (auto& worker : threads) worker.request_stop();
+        for (size_t i=0; i < threads.size(); i++) task_queue.enqueue(task_producer, std::nullopt);
+        for (auto& worker : threads) worker.join();
         threads.clear();
         return false;
     }
@@ -148,16 +158,16 @@ public:
     void queue_new_epoch() {
         std::vector<size_t> indices(num_cubes);
         std::iota(indices.begin(), indices.end(), 0);
-        std::ranges::shuffle(indices, main_rng);
-        std::vector<std::vector<std::size_t>> tasks;
+        std::shuffle(indices.begin(), indices.end(), main_rng);
+        std::vector<std::optional<std::vector<std::size_t>>> tasks;
         tasks.reserve(length);
         const size_t full_batches = num_cubes / max_batch_size;
         for (size_t i=0; i < full_batches; i++) {
-            tasks.emplace_back(indices.begin() + i * max_batch_size, indices.begin() + (i + 1) * max_batch_size);
+            tasks.push_back(std::optional<std::vector<std::size_t>>{std::vector<std::size_t>{indices.begin() + i * max_batch_size, indices.begin() + (i + 1) * max_batch_size}});
         }
         if constexpr (use_adj_mtx) {
             if (full_batches < length) {
-                tasks.emplace_back(indices.begin() + full_batches * max_batch_size, indices.end());
+                tasks.push_back(std::optional<std::vector<std::size_t>>{std::vector<std::size_t>{indices.begin() + full_batches * max_batch_size, indices.end()}});
             }
         }
         task_queue.enqueue_bulk(task_producer, std::make_move_iterator(tasks.begin()), tasks.size());
@@ -192,21 +202,21 @@ public:
     }
 
     std::array<std::valarray<double>, 2> process_cube(const std::size_t index, pcg32& rng) {
-        double noise = std::ranges::clamp(noise_dist(rng), 0.3, 0.7);
+        double noise = std::min(std::max(0.3, noise_dist(rng)), 0.7);
         std::valarray<double> x1 = x_mtx[std::slice(index * num_cards, num_cards, 1)];
         std::size_t count = static_cast<std::size_t>(x1.sum());
-        size_t to_flip = std::ranges::clamp(noise * count, 1.0, count - 1.0);
+        size_t to_flip = std::min(std::max(1.0, noise * count), count - 1.0);
 
         std::valarray<double> y1 = x1;
         auto to_exclude = sample_no_replacement(to_flip, x1, true_indices, rng);
         auto to_include = sample_no_replacement(to_flip, neg_sampler * x1, true_indices, rng);
         std::valarray<double> to_exclude_sampler(0.0, num_cards);
         to_exclude_sampler[to_exclude] = neg_sampler[to_exclude];
-        auto y_to_exclude = sample_no_replacement(to_flip / 8, to_exclude_sampler, true_indices, rng);
+        /* auto y_to_exclude = sample_no_replacement(to_flip / 8, to_exclude_sampler, true_indices, rng); */
 
         x1[to_exclude] = 0;
         x1[to_include] = 1;
-        y1[y_to_exclude] = 0;
+        /* y1[y_to_exclude] = 0; */
 
         return {x1, y1};
     }
@@ -224,27 +234,29 @@ public:
         return {x2, y_mtx[std::slice(actual_index * num_cards, num_cards, 1)]};
     }
 
-    void worker_thread(std::stop_token st, pcg32 rng) {
+    void worker_thread(pcg32 rng) {
         moodycamel::ConsumerToken consume_token(task_queue);
         moodycamel::ProducerToken produce_token(result_queue);
-        std::vector<size_t> task;
-        while(!st.stop_requested()) {
+        std::optional<std::vector<size_t>> task;
+        while(true) {
             // Time here is in microseconds.
             if(task_queue.wait_dequeue_timed(consume_token, task, 100'000)) {
-                std::valarray<double> result_x1(task.size() * num_cards);
-                std::valarray<double> result_y1(task.size() * num_cards);
+                if (!task) return;
+                auto& unpacked_task = *task;
+                std::valarray<double> result_x1(unpacked_task.size() * num_cards);
+                std::valarray<double> result_y1(unpacked_task.size() * num_cards);
                 size_t offset = 0;
-                for (const size_t index : task) {
+                for (const size_t index : unpacked_task) {
                     const auto [x1, y1] = process_cube(index, rng);
                     result_x1[std::slice(offset * num_cards, num_cards, 1)] = x1;
                     result_y1[std::slice(offset * num_cards, num_cards, 1)] = y1;
                     offset++;
                 }
-                const std::array<std::size_t, 2> shape{task.size(), num_cards};
+                const std::array<std::size_t, 2> shape{unpacked_task.size(), num_cards};
                 if constexpr (use_adj_mtx) {
-                    std::valarray<double> result_x2(task.size() * num_cards);
-                    std::valarray<double> result_y2(task.size() * num_cards);
-                    for (size_t i=0; i < task.size(); i++) {
+                    std::valarray<double> result_x2(unpacked_task.size() * num_cards);
+                    std::valarray<double> result_y2(unpacked_task.size() * num_cards);
+                    for (size_t i=0; i < unpacked_task.size(); i++) {
                         const auto [x2, y2] = process_adj_mtx(rng);
                         result_x2[std::slice(offset * num_cards, num_cards, 1)] = x2;
                         result_y2[std::slice(offset * num_cards, num_cards, 1)] = y2;

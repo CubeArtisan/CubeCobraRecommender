@@ -33,6 +33,6 @@ target_include_directories(generator PRIVATE extern/pcg-cpp/include)
 
 target_link_libraries(generator PRIVATE concurrentqueue)
 
-target_compile_features(generator PRIVATE cxx_std_20)
+target_compile_features(generator PRIVATE cxx_std_17)
 
 install(TARGETS generator DESTINATION .)

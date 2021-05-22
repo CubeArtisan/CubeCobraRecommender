@@ -199,36 +199,16 @@ if __name__ == '__main__':
         print(f'Loading metapath adjacency matrices')
         return tuple(sp.load_npz(filename).tocoo() / 1024 for filename in tqdm(list((data / 'adjs').iterdir())))
 
-    generator = GeneratorWithoutAdj(
-        load_adj_mtx(),
-        load_cubes(),
-        args.num_workers,
-        args.batch_size,
-        args.seed,
-        args.noise,
-        args.noise_stddev,
-    )
-
-    print(f'Creating a pool with {args.num_workers} different workers.')
-    with generator:
-        print('Loading decks with sideboards.')
-        # cubes, cube_ids = utils.build_sparse_cubes(cube_folder, is_valid_cube)
-        # cube_id_to_index = {v: i for i, v in enumerate(cube_ids)}
-        cube_id_to_index = {}
-        wrapped = GeneratorWrapper(
-            generator, num_cards=num_cards, batch_size=args.batch_size,
-            decks=utils.build_deck_with_sides(decks_folder, cube_id_to_index,
-                                              lambda deck: len(deck['side']) > 5 and 23 <= len(deck['main']) <= 60)
-        )
-
-        print('Setting Up Model . . . \n')
-        checkpoint_dir = output / 'checkpoint'
-        THRESHOLDS=[0.1, 0.25, 0.5, 0.75, 0.9]
+    mirrored_strategy = tf.distribute.MirroredStrategy()
+    print('Setting Up Model . . . \n')
+    checkpoint_dir = output / 'checkpoint'
+    THRESHOLDS=[0.1, 0.25, 0.5, 0.75, 0.9]
+    with mirrored_strategy.scope():
         recommender = MetapathRecommender(
             card_metapaths=load_metapaths(), embed_dims=args.embed_dims, l1_weight=args.l1_weight,
             metapath_dims=args.metapath_dims, num_heads=args.num_heads, dropout=args.dropout,
             margin=args.margin, decks_weight=args.decks_weight, l2_weight=args.l2_weight,
-            jit_scope=jit_scope,
+            jit_scope=jit_scope, name='MetapathRecommender',
             cube_metrics=[
                 *[tf.keras.metrics.Recall(t, name=f'cube_recall_{t}') for t in THRESHOLDS],
                 *[tf.keras.metrics.PrecisionAtRecall(t, name=f'cube_precision_at_recall_{t}') for t in THRESHOLDS],
@@ -240,22 +220,40 @@ if __name__ == '__main__':
                 *[tf.keras.metrics.PrecisionAtRecall(t, name=f'deck_precision_at_recall_{t}') for t in THRESHOLDS],
                 *[tf.keras.metrics.RecallAtPrecision(t, name=f'deck_recall_at_precision_{t}') for t in THRESHOLDS],
                 *[tf.keras.metrics.Precision(t, name=f'deck_precision_{t}') for t in THRESHOLDS],
-            ],
-            name='MetapathRecommender')
+            ]
+        )
+        optimizer = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
+    output.mkdir(exist_ok=True, parents=True)
+    latest = tf.train.latest_checkpoint(str(output))
+    if latest is not None:
+        print('Loading Checkpoint. Saved values are:')
+        recommender.load_weights(latest)
+    else:
+        with open(output / 'int_to_card.json', 'w') as int_to_card_file:
+            json.dump(int_to_card, int_to_card_file)
+        with open(output / 'args.json', 'w') as args_file:
+            json.dump(args.__dict__, args_file, indent=2)
+    recommender.compile(optimizer=optimizer)
 
-
-        output.mkdir(exist_ok=True, parents=True)
-        latest = tf.train.latest_checkpoint(str(output))
-        if latest is not None:
-            print('Loading Checkpoint. Saved values are:')
-            recommender.load_weights(latest)
-        else:
-            with open(output / 'int_to_card.json', 'w') as int_to_card_file:
-                json.dump(int_to_card, int_to_card_file)
-            with open(output / 'args.json', 'w') as args_file:
-                json.dump(args.__dict__, args_file, indent=2)
-        recommender.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=args.learning_rate),
+    generator = GeneratorWithoutAdj(
+        load_adj_mtx(),
+        load_cubes(),
+        args.num_workers,
+        args.batch_size,
+        args.seed,
+        args.noise,
+        args.noise_stddev,
+    )
+    print(f'Creating a pool with {args.num_workers} different workers.')
+    with generator, mirrored_strategy.scope():
+        print('Loading decks with sideboards.')
+        # cubes, cube_ids = utils.build_sparse_cubes(cube_folder, is_valid_cube)
+        # cube_id_to_index = {v: i for i, v in enumerate(cube_ids)}
+        cube_id_to_index = {}
+        wrapped = GeneratorWrapper(
+            generator, num_cards=num_cards, batch_size=args.batch_size,
+            decks=utils.build_deck_with_sides(decks_folder, cube_id_to_index,
+                                              lambda deck: len(deck['side']) > 5 and 23 <= len(deck['main']) <= 60)
         )
 
         print('Starting training')
