@@ -286,13 +286,13 @@ if __name__ == '__main__':
         callbacks.append(nan_callback)
         callbacks.append(tb_callback)
         callbacks.append(lr_callback)
-        callbacks.append(tqdm_callback)
+        # callbacks.append(tqdm_callback)
         # callbacks.append(es_callback)
         recommender.fit(
             wrapped,
             epochs=args.epochs,
             callbacks=callbacks,
-            verbose=0,
+            verbose=2,
         )
         print('Saving final model')
         recommender.save(output, save_format='tf')

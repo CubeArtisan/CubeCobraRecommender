@@ -1,0 +1,33 @@
+{
+  "requiresCompatibilities": [
+    "EC2"
+  ],
+  "containerDefinitions": [{
+    "command": [
+      "mkdir -p /CubeCobra && cd /CubeCobra && git clone --recurse-submodules --shallow-submodules -b knowledge-graph --depth 1 https://github.com/ruler501/CubeCobraRecommender.git && chmod +x -R /CubeCobra/ && cd CubeCobraRecommender && ./train_model.sh"
+    ],
+    "entryPoint": ["sh", "-c"],
+    "name": "CubeCobraRecommender-training",
+    "image": "763104351884.dkr.ecr.us-east-1.amazonaws.com/tensorflow-training:2.4.1-gpu-py37-cu110-ubuntu18.04",
+    "memory": 6400,
+    "cpu": 32,
+    "resourceRequirements": [{
+      "type": "GPU",
+      "value": "4"
+    }],
+    "essential": true,
+    "logConfiguration": {
+      "logDriver": "awslogs",
+      "options": {
+        "awslogs-group": "awslogs-tf-ecs",
+        "awslogs-region": "us-east-1",
+        "awslogs-stream-prefix": "tf",
+        "awslogs-create-group": "true"
+      }
+    }
+  }],
+  "volumes": [],
+  "networkMode": "bridge",
+  "placementConstraints": [],
+  "family": "tensorflow-training"
+}
