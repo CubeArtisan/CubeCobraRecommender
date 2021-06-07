@@ -4,6 +4,8 @@ output/
 venv/
 __pycache__/
 .mypy_cache/
-.venv/
+.venv*/
 .direnv/
 logs/
+.idea/
+ml_files/

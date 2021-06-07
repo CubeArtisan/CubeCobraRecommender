@@ -1,0 +1,7 @@
+FROM python/python3.9
+
+WORKDIR /CubeCobraRecommender
+COPY src src
+COPY data data
+
+ENTRYPOINT ["python", "-m", "src.non_ml.parse_picks"]
