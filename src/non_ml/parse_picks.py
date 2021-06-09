@@ -400,6 +400,7 @@ def parse_picks(pool, costs_list, card_devotions, card_colors, num_climbs=None, 
         logger.info(f'Parsed #{parsed:05d} with {usable:07n} usable picks from {draftCount:06n} usable drafts for a total of {total_usable:010n} picks from {total_drafts:09n} drafts.')
     return inner
 
+
 def picks_dataset(num_climbs=NUM_LAND_COMBS, proc_pool=None, num_workers=None, tf=None, cycle_length=8):
     card_devotions, card_colors, costs_list = load_card_data()
     return tf.data.Dataset.list_files('data/drafts/*.json', shuffle=True).interleave(
@@ -408,6 +409,7 @@ def picks_dataset(num_climbs=NUM_LAND_COMBS, proc_pool=None, num_workers=None, t
         ),
         cycle_length=cycle_length, num_parallel_calls=cycle_length, block_length=45, deterministic=False,
     ).shuffle(2**20).enumerate().prefetch(tf.data.AUTOTUNE)
+
 
 def load_picks(cache_type, batch_size, num_workers=128):
     import tensorflow as tf
@@ -424,10 +426,10 @@ def load_picks(cache_type, batch_size, num_workers=128):
         reader_func=lambda ds:
             ds.shuffle(NUM_TRAIN_SHARDS)
               .interleave(lambda x: x,
-                          cycle_length=num_workers,
-                          num_parallel_calls=tf.data.AUTOTUNE,
+                          cycle_length=128,
+                          num_parallel_calls=128,
                           deterministic=False)
-    ).padded_batch(batch_size, ((), (
+    ).shuffle(2**16).padded_batch(batch_size, ((), (
         (MAX_IN_PACK,),
         (MAX_SEEN,),
         (),
@@ -438,7 +440,7 @@ def load_picks(cache_type, batch_size, num_workers=128):
         (NUM_LAND_COMBS, MAX_SEEN),
         (NUM_LAND_COMBS, MAX_PICKED),
         (NUM_LAND_COMBS, MAX_IN_PACK),
-    )), drop_remainder=True).prefetch(tf.data.AUTOTUNE)
+    )), drop_remainder=True).prefetch(2**22 // batch_size // num_workers)
 
 def features_to_ragged(in_pack_card_indices, seen_indices, seen_counts,
                        picked_card_indices, picked_counts, coords, coord_weights,

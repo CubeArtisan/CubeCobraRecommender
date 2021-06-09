@@ -6,37 +6,37 @@ import os
 import shutil
 from pathlib import Path
 
-import numpy as np
 import tensorflow as tf
 import tensorflow_addons as tfa
 from tensorboard.plugins.hparams import api as hp
 from tensorboard.plugins import projector
 
 from .draftbots import DraftBot
-from .losses import CustomCrossEntropy
-from ..non_ml.parse_picks import load_picks, MAX_IN_PACK
+from ..non_ml.parse_picks import load_picks
 
 locale.setlocale(locale.LC_ALL, '')
 
-BATCH_CHOICES = (128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 64532)
+BATCH_CHOICES = (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 64532)
 EMBED_DIMS_CHOICES = (2, 4, 8, 16, 32, 64, 128, 256, 512)
+NUM_HEAD_CHOICES = tuple(2 ** i for i in range(6))
 
 HP_BATCH_SIZE = hp.HParam('batch_size', hp.Discrete(BATCH_CHOICES))
 HP_TEMPERATURE = hp.HParam('temperature', hp.RealInterval(1e-05, 1e+05))
 HP_MAX_TEMPERATURE = hp.HParam('max_temperature', hp.RealInterval(1e-05, 1e+05))
 HP_EMBED_DIMS = hp.HParam('embedding_dimensions', hp.Discrete(EMBED_DIMS_CHOICES))
 HP_LEARNING_RATE = hp.HParam('learning_rate', hp.RealInterval(1e-06, 1e+05))
+HP_L1_WEIGHT = hp.HParam('l1_loss_weight', hp.RealInterval(0.0, 1.0))
+HP_L2_WEGIHT = hp.HParam('l2_loss_weight', hp.RealInterval(0.0, 1.0))
+HP_NUM_HEADS = hp.HParam('num_heads', hp.Discrete(NUM_HEAD_CHOICES))
 
 
 class TensorBoardFix(tf.keras.callbacks.TensorBoard):
     """
     This fixes incorrect step values when using the TensorBoard callback with custom summary ops
     """
-
     def on_train_begin(self, *args, **kwargs):
         super(TensorBoardFix, self).on_train_begin(*args, **kwargs)
         tf.summary.experimental.set_step(self._train_step)
-
 
     def on_test_begin(self, *args, **kwargs):
         super(TensorBoardFix, self).on_test_begin(*args, **kwargs)
@@ -67,6 +67,9 @@ if __name__ == "__main__":
     parser.add_argument('--max-temperature', type=float, default=25000, choices=[Range(1e-05, 1e+05)], help="The maximum temperature (scaling factor for scores) that should be used.")
     parser.add_argument('--learning-rate', '-l', type=float, default=0.25, choices=[Range(1e-05, 1e+05)], help="The initial learning rate to train with.")
     parser.add_argument('--embed-dims', '-d', type=int, default=16, choices=EMBED_DIMS_CHOICES, help="The number of dimensions to use for card embeddings.")
+    parser.add_argument('--l1-weight', '-l1', type=float, default=0.25, help='The relative weight of the l1 regularization on the oracle weights that pulls them towards 1/6.')
+    parser.add_argument('--l2-weight', '-l2', type=float, default=0.125, help='The relative weight of the l2 regularization on the oracle weight logits that pulls them towards 1/6.')
+    parser.add_argument('--num-heads', type=int, default=16, help='The number of heads to use for the self attention layer.')
     float_type_group = parser.add_mutually_exclusive_group()
     float_type_group.add_argument('-16', dest='float_type', const=tf.float16, action='store_const', help='Use 16 bit numbers throughout the model.')
     float_type_group.add_argument('--auto16', '-16rw', action='store_true', help='Automatically rewrite some operations to use 16 bit numbers.')
@@ -86,8 +89,11 @@ if __name__ == "__main__":
     profile_group.add_argument('--no-profile', action='store_false', dest='profile', help='Disable profiling a range of batches from the first epoch (the default).')
     parser.set_defaults(float_type=tf.float32, use_xla=True, profile=False)    
     args = parser.parse_args()
-    hparams = { HP_BATCH_SIZE: args.batch_size, HP_TEMPERATURE: args.temperature, HP_LEARNING_RATE: args.learning_rate,
-                HP_MAX_TEMPERATURE: args.max_temperature, HP_EMBED_DIMS: args.embed_dims }
+    hparams = {
+        HP_BATCH_SIZE: args.batch_size, HP_TEMPERATURE: args.temperature, HP_LEARNING_RATE: args.learning_rate,
+        HP_MAX_TEMPERATURE: args.max_temperature, HP_EMBED_DIMS: args.embed_dims, HP_L1_WEIGHT: args.l1_weight,
+        HP_L2_WEGIHT: args.l2_weight, HP_NUM_HEADS: args.num_heads,
+    }
 
     log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     if args.debug:
@@ -124,12 +130,11 @@ if __name__ == "__main__":
         'scoped_allocator_optimization': True,
         'pin_to_host_optimization': True,
         'implementation_selector': True,
-        'auto_mixed_precision': True,
         'disable_meta_optimizer': False,
         'min_graph_nodes': 1,
     })
-    tf.config.threading.set_intra_op_parallelism_threads(32)
-    tf.config.threading.set_inter_op_parallelism_threads(32)
+    tf.config.threading.set_intra_op_parallelism_threads(128)
+    tf.config.threading.set_inter_op_parallelism_threads(128)
 
     print('Loading card data for seeding weights.')
     with open('data/maps/int_to_card.json', 'r') as cards_file:
@@ -146,38 +151,32 @@ if __name__ == "__main__":
     embedding = projector_config.embeddings.add()
     embedding.tensor_name = "card_embeddings/.ATTRIBUTES/VARIABLE_VALUE"
     embedding.metadata_path = metadata
-    embedding = projector_config.embeddings.add()
-    embedding.tensor_name = "card_ratings/.ATTRIBUTES/VARIABLE_VALUE"
-    embedding.metadata_path = metadata
     projector.visualize_embeddings(log_dir, projector_config)
     
     print('Creating the pick Datasets.')
-    # full_dataset = load_picks('full', args.batch_size, num_workers=32, compressed=args.compressed, ragged=args.ragged)
     train_dataset = load_picks('full', args.batch_size, num_workers=32)
-    # test_dataset = load_picks('test', args.batch_size, num_workers=32, ragged=args.ragged, pad=True)
+    # test_dataset = load_picks('test', args.batch_size, num_workers=32)
     num_batches = train_dataset.cardinality().numpy()
     print('Loading DraftBot model.')
     output_dir = f'././ml_files/{args.name}/'
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    draftbots = DraftBot(len(card_ratings), args.temperature, args.batch_size,
-                         embed_dims=args.embed_dims,
-                         name='DraftBots')
+    summary_period = num_batches // 20
+    draftbots = DraftBot(len(card_ratings), args.temperature, args.batch_size, l1_loss_weight=args.l1_weight,
+                         l2_loss_weight=args.l2_weight, embed_dims=args.embed_dims, summary_period=1024,
+                         num_heads=args.num_heads, name='DraftBots')
     latest = tf.train.latest_checkpoint(output_dir)
     if latest is not None:
-        print('Loading Checkpoint. Saved values are:')
+        print('Loading Checkpoint.')
         draftbots.load_weights(latest)
         draftbots.temperature.assign(args.temperature)
     # opt = tf.keras.optimizers.Adam(learning_rate=args.learning_rate)
     opt = tfa.optimizers.LazyAdam(learning_rate=args.learning_rate)
     if args.float_type == tf.float16:
-        # opt = tf.keras.mixed_precision.LossScaleOptimizer(opt, dynamic=False, initial_scale=8192)
-        opt = tf.keras.mixed_precision.LossScaleOptimizer(opt, dynamic_growth_steps=5, initial_scale=2**15)
+        opt = tf.keras.mixed_precision.LossScaleOptimizer(opt, dynamic_growth_steps=num_batches // 128)
     if args.auto16:
         print("WARNING 16 bit rewrite mode can cause numerical instabilities.")
         tf.compat.v1.mixed_precision.enable_mixed_precision_graph_rewrite(opt)
-    draftbots.compile(
-        optimizer=opt,
-    )
+    draftbots.compile(optimizer=opt)
 
     print('Starting training')
     callbacks = []
@@ -198,45 +197,45 @@ if __name__ == "__main__":
         mode='min',
         save_freq='epoch')
     nan_callback = tf.keras.callbacks.TerminateOnNaN()
-    es_callback = tf.keras.callbacks.EarlyStopping(monitor='accuracy', patience=16,
+    es_callback = tf.keras.callbacks.EarlyStopping(monitor='accuracy', patience=30,
                                                    mode='max', restore_best_weights=True, verbose=True)
     lr_callback = tf.keras.callbacks.ReduceLROnPlateau(monitor='accuracy', factor=0.5, mode='max',
-                                                       patience=8, min_delta=1/(2**13), cooldown=4, min_lr=1/(2**17),
+                                                       patience=12, min_delta=1/(2**13), cooldown=6, min_lr=1/(2**17),
                                                        verbose=True)
-    print(num_batches // 10, 'profile:', args.profile)
     tb_callback = TensorBoardFix(log_dir=log_dir, histogram_freq=1, write_graph=True,
-                                 update_freq=num_batches // 32, embeddings_freq=1,
-                                 #profile_batch=0 if not args.profile else (20, 30))
-                                 profile_batch=0 if args.debug or not args.profile
-                                                 else (int(1.56 * num_batches),
-                                                       int(1.64 * num_batches)))
+                                 update_freq=256, embeddings_freq=8,
+                                 profile_batch=0 if args.debug or not args.profile else (int(1.56 * num_batches),
+                                                                                         int(1.56 * num_batches) + 16))
     hp_callback = hp.KerasCallback(log_dir, hparams)
-    scale_factor = tf.cast(tf.math.pow(args.max_temperature / args.temperature, 1 / (args.epochs - 2)), dtype=tf.float64)
+    scale_factor = tf.cast(tf.math.pow(args.max_temperature / args.temperature, 1 / (args.epochs - 2)), dtype=draftbots.compute_dtype)
     print('temperature:', args.temperature, 'max_temperature:', args.max_temperature, 'scale_factor:', scale_factor)
     temp_callback = tf.keras.callbacks.LambdaCallback(on_epoch_end=lambda epoch, logs: draftbots.temperature.assign(draftbots.temperature * scale_factor))
+    tqdm_callback = tfa.callbacks.TQDMProgressBar(update_per_second=5)
     if not args.debug:
         # callbacks.append(mcp_callback)
         callbacks.append(cp_callback)
     callbacks.append(nan_callback)
     # callbacks.append(es_callback)
-    callbacks.append(lr_callback)
+    # callbacks.append(lr_callback)
     callbacks.append(tb_callback)
     callbacks.append(hp_callback)
     callbacks.append(temp_callback)
-    # verify_target = np.zeros((test_dataset.cardinality().numpy(), args.batch_size, MAX_IN_PACK))
-    # verify_target[:,:,0] = 1
-    # verify_target = tf.data.Dataset.from_tensor_slices(tf.constant(verify_target, dtype=tf.float64))
-    train_dataset_par = tf.data.Dataset.range(args.num_workers).interleave(lambda _: load_picks('full', args.batch_size, num_workers=args.num_workers), cycle_length=args.num_workers, num_parallel_calls=args.num_workers, deterministic=False)
-    print(train_dataset_par.element_spec)
+    callbacks.append(tqdm_callback)
+    train_dataset_par = tf.data.Dataset.range(args.num_workers)\
+                                       .interleave(lambda _: load_picks('full', args.batch_size, num_workers=args.num_workers),
+                                                   cycle_length=args.num_workers, num_parallel_calls=args.num_workers,
+                                                   deterministic=False)\
+                                       .repeat()
     draftbots.fit(
-        train_dataset_par.repeat().prefetch(tf.data.AUTOTUNE),
-        steps_per_epoch=num_batches,
+        train_dataset_par.prefetch(tf.data.AUTOTUNE),
+        steps_per_epoch=1024,
         # validation_data=tf.data.Dataset.zip((
         #     test_dataset,
         #     verify_target,
         # )).prefetch(tf.data.AUTOTUNE),
         epochs=args.epochs,
         callbacks=callbacks,
+        verbose=0
     )
     if not args.debug:
         print('Saving final model.')
