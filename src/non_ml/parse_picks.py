@@ -440,7 +440,7 @@ def load_picks(cache_type, batch_size, num_workers=128):
         (NUM_LAND_COMBS, MAX_SEEN),
         (NUM_LAND_COMBS, MAX_PICKED),
         (NUM_LAND_COMBS, MAX_IN_PACK),
-    )), drop_remainder=True).prefetch(2**22 // batch_size // num_workers)
+    )), drop_remainder=True).prefetch(2**21 // batch_size // num_workers)
 
 def features_to_ragged(in_pack_card_indices, seen_indices, seen_counts,
                        picked_card_indices, picked_counts, coords, coord_weights,

@@ -133,8 +133,8 @@ if __name__ == "__main__":
         'disable_meta_optimizer': False,
         'min_graph_nodes': 1,
     })
-    tf.config.threading.set_intra_op_parallelism_threads(128)
-    tf.config.threading.set_inter_op_parallelism_threads(128)
+    tf.config.threading.set_intra_op_parallelism_threads(32)
+    tf.config.threading.set_inter_op_parallelism_threads(64)
 
     print('Loading card data for seeding weights.')
     with open('data/maps/int_to_card.json', 'r') as cards_file:
@@ -200,9 +200,9 @@ if __name__ == "__main__":
     es_callback = tf.keras.callbacks.EarlyStopping(monitor='accuracy', patience=30,
                                                    mode='max', restore_best_weights=True, verbose=True)
     lr_callback = tf.keras.callbacks.ReduceLROnPlateau(monitor='accuracy', factor=0.5, mode='max',
-                                                       patience=12, min_delta=1/(2**13), cooldown=6, min_lr=1/(2**17),
+                                                       patience=16, min_delta=1/(2**13), cooldown=8, min_lr=1/(2**17),
                                                        verbose=True)
-    tb_callback = TensorBoardFix(log_dir=log_dir, histogram_freq=1, write_graph=True,
+    tb_callback = TensorBoardFix(log_dir=log_dir, histogram_freq=0, write_graph=True,
                                  update_freq=256, embeddings_freq=8,
                                  profile_batch=0 if args.debug or not args.profile else (int(1.56 * num_batches),
                                                                                          int(1.56 * num_batches) + 16))
@@ -216,7 +216,7 @@ if __name__ == "__main__":
         callbacks.append(cp_callback)
     callbacks.append(nan_callback)
     # callbacks.append(es_callback)
-    # callbacks.append(lr_callback)
+    callbacks.append(lr_callback)
     callbacks.append(tb_callback)
     callbacks.append(hp_callback)
     callbacks.append(temp_callback)
