@@ -1,3 +1,9 @@
 [submodule "extern/tensorboard"]
 	path = extern/tensorboard
 	url = https://github.com/ruler501/tensorboard
+[submodule "extern/pcg-cpp"]
+	path = extern/pcg-cpp
+	url = https://github.com/imneme/pcg-cpp.git
+[submodule "extern/concurrentqueue"]
+	path = extern/concurrentqueue
+	url = https://github.com/cameron314/concurrentqueue

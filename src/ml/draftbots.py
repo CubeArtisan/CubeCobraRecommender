@@ -81,8 +81,11 @@ class DraftBot(tf.keras.models.Model):
         in_pack_cards, seen_cards, seen_counts,\
             picked_cards, picked_counts, coords, coord_weights,\
             prob_seens, prob_pickeds, prob_in_packs = inputs
-        
+
         with tf.experimental.async_scope():
+            prob_seens = tf.cast(prob_seens, dtype=self.compute_dtype) / tf.constant(255, dtype=self.compute_dtype)
+            prob_pickeds = tf.cast(prob_pickeds, dtype=self.compute_dtype) / tf.constant(255, dtype=self.compute_dtype)
+            prob_in_packs = tf.cast(prob_in_packs, dtype=self.compute_dtype) / tf.constant(255, dtype=self.compute_dtype)
             in_pack_mask = tf.expand_dims(tf.cast(in_pack_cards > 0, dtype=tf.float32), 2)
         with tf.experimental.async_scope():
             picked_ratings = tf.nn.sigmoid(tf.gather(self.ratings, picked_cards), name='picked_ratings')
@@ -90,8 +93,8 @@ class DraftBot(tf.keras.models.Model):
             seen_ratings = tf.nn.sigmoid(tf.gather(self.ratings, seen_cards), name='seen_ratings')
             picked_card_embeds = tf.gather(self.card_embeddings, picked_cards, name='picked_card_embeds')
             normalized_in_pack_embeds = tf.math.l2_normalize(tf.gather(self.card_embeddings, in_pack_cards), name='normalized_in_pack_embeds')
-            normalized_picked_embeds = tf.math.l2_normalize(tf.gather(self.card_embeddings, picked_cards), name='normalized_picked_embeds')
-            normalized_seen_embeds = tf.math.l2_normalize(tf.gather(self.card_embeddings, seen_cards), name='normalized_seen_embeds')
+            # normalized_picked_embeds = tf.math.l2_normalize(tf.gather(self.card_embeddings, picked_cards), name='normalized_picked_embeds')
+            # normalized_seen_embeds = tf.math.l2_normalize(tf.gather(self.card_embeddings, seen_cards), name='normalized_seen_embeds')
             oracle_weight_values = tf.nn.sigmoid(tf.gather_nd(self.oracle_weights, coords), name='oracle_weight_values')  # (-1, 4, 6)
         picked_card_embeds._keras_mask = picked_cards > 0
         with tf.experimental.async_scope():
@@ -112,23 +115,23 @@ class DraftBot(tf.keras.models.Model):
                 pick_synergy_weights,
                 name='pick_synergies_scores'
             )
-            internal_synergy_scores = tf.einsum(
-                'ble,bpe,blp,b,b->bl',
-                pool_embed,
-                normalized_picked_embeds,
-                prob_pickeds,
-                1 / tf.math.maximum(picked_counts, 1),
-                internal_synergy_weights,
-                name='internal_synergies_scores'
-            )
-            seen_synergy_scores = tf.einsum(
-                'ble,bse,bls,b,b->bl',
-                pool_embed, normalized_seen_embeds,
-                prob_seens,
-                1 / tf.math.maximum(seen_counts, 1),
-                seen_synergy_weights,
-                name='internal_synergies_scores'
-            )
+            # internal_synergy_scores = tf.einsum(
+            #     'ble,bpe,blp,b,b->bl',
+            #     pool_embed,
+            #     normalized_picked_embeds,
+            #     prob_pickeds,
+            #     1 / tf.math.maximum(picked_counts, 1),
+            #     internal_synergy_weights,
+            #     name='internal_synergies_scores'
+            # )
+            # seen_synergy_scores = tf.einsum(
+            #     'ble,bse,bls,b,b->bl',
+            #     pool_embed, normalized_seen_embeds,
+            #     prob_seens,
+            #     1 / tf.math.maximum(seen_counts, 1),
+            #     seen_synergy_weights,
+            #     name='internal_synergies_scores'
+            # )
             colors_scores = tf.einsum(
                 'blp,bp,b,b->bl',
                 prob_pickeds, picked_ratings,
@@ -144,63 +147,71 @@ class DraftBot(tf.keras.models.Model):
                 name='openness_scores'
             )
 
-        raw_scores = rating_scores + pick_synergy_scores \
-            + tf.expand_dims(internal_synergy_scores + seen_synergy_scores
-                             + colors_scores + openness_scores, 1)
+        raw_scores = rating_scores + pick_synergy_scores + tf.expand_dims(colors_scores + openness_scores, 1)
+            # + tf.expand_dims(internal_synergy_scores + seen_synergy_scores
+            #                  + colors_scores + openness_scores, 1)
         scores = tf.cast(self.temperature * raw_scores, dtype=tf.float32)
         max_scores = tf.stop_gradient(tf.reduce_max(scores, [1, 2], keepdims=True))
         lse_scores = tf.math.reduce_sum(tf.math.exp(scores - max_scores) * in_pack_mask, 2, name='lse_exp_scores')
         choice_probs = lse_scores / tf.math.reduce_sum(lse_scores, 1, keepdims=True)
-        if tf.summary.experimental.get_step() % self.summary_period == 0:
-            individual_score_diffs = \
-                [tf.reduce_max(s, [1, 2]) - tf.math.reduce_min(s, [1, 2]) for s in
-                 (rating_scores, pick_synergy_scores)] \
-                + [tf.math.reduce_max(s, -1) - tf.math.reduce_min(s, -1) for s in
-                   (internal_synergy_scores, seen_synergy_scores, colors_scores, openness_scores)]
-            oracle_weights_orig = tf.nn.sigmoid(self.oracle_weights)
-            num_cards_in_pack = tf.reduce_sum(in_pack_mask, [1, 2])
-            ratings_orig = tf.nn.sigmoid(self.ratings[1:])
-            max_probs = tf.math.reduce_max(choice_probs, 1)
-            max_score = tf.math.reduce_max(raw_scores, [1, 2])
-            min_score = tf.math.reduce_min(raw_scores, [1, 2])
-            max_diff = max_score - min_score
-            min_correct_prob = tf.math.reduce_min(choice_probs[:, 0])
-            with tf.xla.experimental.jit_scope(compile_ops=False):
-                tf.summary.scalar('temperature', self.temperature)
-                # tf.summary.histogram('weights/card_embeddings', self.card_embeddings[1:])
-                tf.summary.histogram('weights/card_ratings', ratings_orig)
-                for i, name in enumerate(('ratings', 'pick_synergy', 'internal_synergy', 'seen_synergy', 'colors', 'openness')):
-                    log_timeseries(f'weights/oracles/{name}', oracle_weights_orig[:, :, i], start_index=1)
-                    tf.summary.histogram(f'outputs/oracles/diffs/{name}', individual_score_diffs[i], -1)
-
-                # tf.summary.histogram('outputs/scores', raw_scores)
-                tf.summary.histogram('outputs/scores/diffs', max_diff)
-                tf.summary.histogram('outputs/scores/max', max_score)
-                tf.summary.histogram('outputs/scores/min', min_score)
-                tf.summary.histogram('outputs/scores/lse/correct', lse_scores[:, 0])
-
-                tf.summary.histogram('outputs/probs/correct/normalized', num_cards_in_pack * choice_probs[:, 0])
-                tf.summary.histogram('outputs/probs/correct', choice_probs[:, 0])
-                tf.summary.scalar('outputs/probs/correct/min', min_correct_prob)
-                tf.summary.histogram('outputs/probs/normalized', tf.expand_dims(num_cards_in_pack, 1) * choice_probs)
-                tf.summary.histogram('outputs/probs', choice_probs)
-                tf.summary.histogram('outputs/probs/max', max_probs)
-                tf.summary.histogram('outputs/probs/max/normalized', num_cards_in_pack * max_probs)
         if training:
+            if tf.summary.experimental.get_step() % self.summary_period == 0:
+                individual_score_diffs = \
+                    [tf.reduce_max(s, [1, 2]) - tf.math.reduce_min(s, [1, 2]) for s in
+                     (rating_scores, pick_synergy_scores)] \
+                    + [0, 0] \
+                    + [tf.math.reduce_max(s, -1) - tf.math.reduce_min(s, -1) for s in (colors_scores, openness_scores)]
+                       # (internal_synergy_scores, seen_synergy_scores, colors_scores, openness_scores)]
+                oracle_weights_orig = tf.nn.sigmoid(self.oracle_weights)
+                num_cards_in_pack = tf.reduce_sum(in_pack_mask, [1, 2])
+                ratings_orig = tf.nn.sigmoid(self.ratings[1:])
+                max_probs = tf.math.reduce_max(choice_probs, 1)
+                max_score = tf.math.reduce_max(raw_scores, [1, 2])
+                min_score = tf.math.reduce_min(raw_scores, [1, 2])
+                max_diff = max_score - min_score
+                max_diff_with_temp = self.temperature * max_diff
+                min_correct_prob = tf.math.reduce_min(choice_probs[:, 0])
+                max_correct_prob = tf.math.reduce_max(choice_probs[:, 0])
+                with tf.xla.experimental.jit_scope(compile_ops=False):
+                    tf.summary.scalar('temperature', self.temperature)
+                    # tf.summary.histogram('weights/card_embeddings', self.card_embeddings[1:])
+                    tf.summary.histogram('weights/card_ratings', ratings_orig)
+                    for i, name in enumerate(
+                            ('ratings', 'pick_synergy', 'internal_synergy', 'seen_synergy', 'colors', 'openness')):
+                        if i == 2 or i == 3:
+                            continue
+                        log_timeseries(f'weights/oracles/{name}', oracle_weights_orig[:, :, i], start_index=1)
+                        tf.summary.histogram(f'outputs/oracles/diffs/{name}', individual_score_diffs[i], -1)
+
+                    # tf.summary.histogram('outputs/scores', raw_scores)
+                    tf.summary.histogram('outputs/scores/diffs', max_diff)
+                    tf.summary.histogram('outputs/scores/diffs/with_temp', max_diff_with_temp)
+                    tf.summary.histogram('outputs/scores/max', max_score)
+                    tf.summary.histogram('outputs/scores/min', min_score)
+                    tf.summary.histogram('outputs/scores/lse/correct', lse_scores[:, 0])
+
+                    tf.summary.histogram('outputs/probs/correct/normalized', num_cards_in_pack * choice_probs[:, 0])
+                    tf.summary.histogram('outputs/probs/correct', choice_probs[:, 0])
+                    tf.summary.scalar('outputs/probs/correct/min', min_correct_prob)
+                    tf.summary.scalar('outputs/probs/correct/max', max_correct_prob)
+                    tf.summary.histogram('outputs/probs/normalized',
+                                         tf.expand_dims(num_cards_in_pack, 1) * choice_probs)
+                    tf.summary.histogram('outputs/probs', choice_probs)
+                    tf.summary.histogram('outputs/probs/max', max_probs)
+                    tf.summary.histogram('outputs/probs/max/normalized', num_cards_in_pack * max_probs)
             used_oracle_weights = tf.gather_nd(self.oracle_weights, coords)
             used_oracle_weights = tf.einsum('bxo,bx->bo', used_oracle_weights, coord_weights, name='oracle_weights')
-            adjusted_oracle_weights = tf.cast(used_oracle_weights - tf.math.log(1 / 6 / (1 - 1 / 6)), dtype=tf.float32)
             return (
                 choice_probs,
-                tf.cast(tf.reduce_sum(tf.math.abs(oracle_weights - (1/6)), 1), dtype=tf.float32),
-                tf.reduce_sum(adjusted_oracle_weights * adjusted_oracle_weights, 1),
+                tf.cast(tf.reduce_sum(tf.math.abs(oracle_weights - (1/2)), 1), dtype=tf.float32),
+                tf.reduce_sum(tf.cast(used_oracle_weights * used_oracle_weights, dtype=tf.float32), 1),
             )
         else:
             return choice_probs
 
     def train_step(self, data):
         with tf.GradientTape() as tape:
-            probs, oracle_l1s, oracle_l2s = self(data[1], training=True)
+            probs, oracle_l1s, oracle_l2s = self(data[0], training=True)
             log_loss = tf.reduce_mean(-tf.math.log(probs[:, 0]))
             l1_loss = tf.reduce_mean(oracle_l1s)
             l2_loss = tf.reduce_mean(oracle_l2s)
@@ -224,6 +235,28 @@ class DraftBot(tf.keras.models.Model):
             'log_loss': self.log_loss_metric.result(),
             'l1_loss': self.l1_loss_metric.result(),
             'l2_loss': self.l2_loss_metric.result(),
+            'accuracy': self.accuracy_metric.result(),
+            'top_2_accuracy': self.top_2_accuracy_metric.result(),
+            'top_3_accuracy': self.top_3_accuracy_metric.result(),
+            'average_prob_correct': self.average_prob_metric.result(),
+        }
+        return result
+
+    def test_step(self, data):
+        probs = self(data[0], training=False)
+        log_loss = tf.reduce_mean(-tf.math.log(probs[:, 0]))
+        loss = log_loss
+
+        with tf.experimental.async_scope():
+            self.loss_metric.update_state(loss)
+            self.log_loss_metric.update_state(log_loss)
+            self.accuracy_metric.update_state(self.default_target, probs)
+            self.top_2_accuracy_metric.update_state(self.default_target, probs)
+            self.top_3_accuracy_metric.update_state(self.default_target, probs)
+            self.average_prob_metric.update_state(probs[:, 0])
+        result = {
+            'loss': self.loss_metric.result(),
+            'log_loss': self.log_loss_metric.result(),
             'accuracy': self.accuracy_metric.result(),
             'top_2_accuracy': self.top_2_accuracy_metric.result(),
             'top_3_accuracy': self.top_3_accuracy_metric.result(),

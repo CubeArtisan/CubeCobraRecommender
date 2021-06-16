@@ -1,4 +1,5 @@
 data/
+data
 output/
 .DS_Store
 venv/
@@ -9,3 +10,8 @@ __pycache__/
 logs/
 .idea/
 ml_files/
+.python-version
+.vs/
+_skbuild/
+dist/
+src/cubecobra_recommender_generators.egg-info/

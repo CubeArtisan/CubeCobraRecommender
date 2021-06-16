@@ -339,7 +339,6 @@ def load_pick(pick, costs_list, card_devotions, card_colors, num_climbs=None):
                                                                         coord_weights, prob_seen,
                                                                         prob_picked, prob_in_pack)))
 
-
 def trim_pick(pick):
     if 'seen' not in pick or len(pick['seen']) > MAX_SEEN or None in pick['seen']:
         # logger.debug(f'Seen was invalid ({len(pick[0])}).')

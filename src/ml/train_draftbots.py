@@ -11,8 +11,8 @@ import tensorflow_addons as tfa
 from tensorboard.plugins.hparams import api as hp
 from tensorboard.plugins import projector
 
-from .draftbots import DraftBot
-from ..non_ml.parse_picks import load_picks
+from src.generated.draftbot_generator import DraftPickGenerator
+from src.ml.draftbots import DraftBot
 
 locale.setlocale(locale.LC_ALL, '')
 
@@ -43,6 +43,20 @@ class TensorBoardFix(tf.keras.callbacks.TensorBoard):
         tf.summary.experimental.set_step(self._val_step)
 
 
+class GeneratorWrapper(tf.keras.utils.Sequence):
+    def __init__(self, generator):
+        self.generator = generator
+
+    def __getitem__(self, item):
+        return (self.generator.__getitem__(item),)
+
+    def __len__(self):
+        return self.generator.__len__()
+
+    def on_epoch_end(self):
+        return self.generator.on_epoch_end()
+
+
 class Range(object):
     def __init__(self, start, end):
         self.start = start
@@ -70,6 +84,7 @@ if __name__ == "__main__":
     parser.add_argument('--l1-weight', '-l1', type=float, default=0.25, help='The relative weight of the l1 regularization on the oracle weights that pulls them towards 1/6.')
     parser.add_argument('--l2-weight', '-l2', type=float, default=0.125, help='The relative weight of the l2 regularization on the oracle weight logits that pulls them towards 1/6.')
     parser.add_argument('--num-heads', type=int, default=16, help='The number of heads to use for the self attention layer.')
+    parser.add_argument('--seed', type=int, default=37, help='The random seed to initialize things with to improve reproducibility.')
     float_type_group = parser.add_mutually_exclusive_group()
     float_type_group.add_argument('-16', dest='float_type', const=tf.float16, action='store_const', help='Use 16 bit numbers throughout the model.')
     float_type_group.add_argument('--auto16', '-16rw', action='store_true', help='Automatically rewrite some operations to use 16 bit numbers.')
@@ -87,7 +102,7 @@ if __name__ == "__main__":
     profile_group = parser.add_mutually_exclusive_group()
     profile_group.add_argument('--profile', action='store_true', help='Enable profiling a range of batches from the first epoch.')
     profile_group.add_argument('--no-profile', action='store_false', dest='profile', help='Disable profiling a range of batches from the first epoch (the default).')
-    parser.set_defaults(float_type=tf.float32, use_xla=True, profile=False)    
+    parser.set_defaults(float_type=tf.float32, use_xla=True, profile=False)
     args = parser.parse_args()
     hparams = {
         HP_BATCH_SIZE: args.batch_size, HP_TEMPERATURE: args.temperature, HP_LEARNING_RATE: args.learning_rate,
@@ -152,17 +167,22 @@ if __name__ == "__main__":
     embedding.tensor_name = "card_embeddings/.ATTRIBUTES/VARIABLE_VALUE"
     embedding.metadata_path = metadata
     projector.visualize_embeddings(log_dir, projector_config)
-    
+
     print('Creating the pick Datasets.')
-    train_dataset = load_picks('full', args.batch_size, num_workers=32)
-    # test_dataset = load_picks('test', args.batch_size, num_workers=32)
-    num_batches = train_dataset.cardinality().numpy()
+    # pick_generator_train = DraftPickGenerator(args.batch_size, args.num_workers // 2, args.num_workers // 4, args.num_workers // 4,
+    #                                           2 ** 16, args.seed, "data/parsed_picks/train_uncompressed/")
+    pick_generator_train = DraftPickGenerator(args.batch_size, args.num_workers, 2, 2, 2 ** 16, args.seed, "data/parsed_picks/full_uncompressed/")
+    print(f"There are {len(pick_generator_train):,} training batches")
+    # pick_generator_test = DraftPickGenerator(args.batch_size, (3 * args.num_workers - 1) // 2, 1, args.num_workers // 4,
+    #                                          2 ** 16, args.seed, "data/parsed_picks/test_uncompressed/")
+    # print(f"There are {len(pick_generator_test):,} testing batches")
     print('Loading DraftBot model.')
     output_dir = f'././ml_files/{args.name}/'
     Path(output_dir).mkdir(parents=True, exist_ok=True)
-    summary_period = num_batches // 20
+    num_batches = len(pick_generator_train)
+    tensorboard_period = num_batches // 8
     draftbots = DraftBot(len(card_ratings), args.temperature, args.batch_size, l1_loss_weight=args.l1_weight,
-                         l2_loss_weight=args.l2_weight, embed_dims=args.embed_dims, summary_period=1024,
+                         l2_loss_weight=args.l2_weight, embed_dims=args.embed_dims, summary_period=tensorboard_period * 4,
                          num_heads=args.num_heads, name='DraftBots')
     latest = tf.train.latest_checkpoint(output_dir)
     if latest is not None:
@@ -200,17 +220,16 @@ if __name__ == "__main__":
     es_callback = tf.keras.callbacks.EarlyStopping(monitor='accuracy', patience=30,
                                                    mode='max', restore_best_weights=True, verbose=True)
     lr_callback = tf.keras.callbacks.ReduceLROnPlateau(monitor='accuracy', factor=0.5, mode='max',
-                                                       patience=16, min_delta=1/(2**13), cooldown=8, min_lr=1/(2**17),
+                                                       patience=4, min_delta=1/(2**13), cooldown=2, min_lr=1/(2**17),
                                                        verbose=True)
-    tb_callback = TensorBoardFix(log_dir=log_dir, histogram_freq=0, write_graph=True,
-                                 update_freq=256, embeddings_freq=8,
-                                 profile_batch=0 if args.debug or not args.profile else (int(1.56 * num_batches),
-                                                                                         int(1.56 * num_batches) + 16))
+    tb_callback = TensorBoardFix(log_dir=log_dir, histogram_freq=1, write_graph=True,
+                                 update_freq=tensorboard_period, embeddings_freq=1,
+                                 profile_batch=0 if args.debug or not args.profile else (num_batches // 4, num_batches // 4 + 64))
     hp_callback = hp.KerasCallback(log_dir, hparams)
     scale_factor = tf.cast(tf.math.pow(args.max_temperature / args.temperature, 1 / (args.epochs - 2)), dtype=draftbots.compute_dtype)
     print('temperature:', args.temperature, 'max_temperature:', args.max_temperature, 'scale_factor:', scale_factor)
     temp_callback = tf.keras.callbacks.LambdaCallback(on_epoch_end=lambda epoch, logs: draftbots.temperature.assign(draftbots.temperature * scale_factor))
-    tqdm_callback = tfa.callbacks.TQDMProgressBar(update_per_second=5)
+    tqdm_callback = tfa.callbacks.TQDMProgressBar(update_per_second=10)
     if not args.debug:
         # callbacks.append(mcp_callback)
         callbacks.append(cp_callback)
@@ -220,23 +239,17 @@ if __name__ == "__main__":
     callbacks.append(tb_callback)
     callbacks.append(hp_callback)
     callbacks.append(temp_callback)
-    callbacks.append(tqdm_callback)
-    train_dataset_par = tf.data.Dataset.range(args.num_workers)\
-                                       .interleave(lambda _: load_picks('full', args.batch_size, num_workers=args.num_workers),
-                                                   cycle_length=args.num_workers, num_parallel_calls=args.num_workers,
-                                                   deterministic=False)\
-                                       .repeat()
-    draftbots.fit(
-        train_dataset_par.prefetch(tf.data.AUTOTUNE),
-        steps_per_epoch=1024,
-        # validation_data=tf.data.Dataset.zip((
-        #     test_dataset,
-        #     verify_target,
-        # )).prefetch(tf.data.AUTOTUNE),
-        epochs=args.epochs,
-        callbacks=callbacks,
-        verbose=0
-    )
+    # callbacks.append(tqdm_callback)
+    tf.summary.experimental.set_step(0)
+    # with pick_generator_train, pick_generator_test:
+    with pick_generator_train:
+        draftbots.fit(
+            GeneratorWrapper(pick_generator_train),
+            # validation_data=GeneratorWrapper(pick_generator_test),
+            epochs=args.epochs,
+            callbacks=callbacks,
+            verbose=1
+        )
     if not args.debug:
         print('Saving final model.')
         Path(f'{output_dir}/final').mkdir(parents=True, exist_ok=True)
