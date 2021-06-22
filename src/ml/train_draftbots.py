@@ -229,7 +229,6 @@ if __name__ == "__main__":
                                  update_freq=tensorboard_period, embeddings_freq=1,
                                  profile_batch=0 if args.debug or not args.profile else (5 * num_batches // 4, 5 * num_batches // 4 + 64))
     hp_callback = hp.KerasCallback(log_dir, hparams)
-    epoch_callback = tf.keras.callbacks.LambdaCallback(on_epoch_end=lambda epoch, logs: draftbots.epoch.assign_add(1))
     if not args.debug:
         callbacks.append(mcp_callback)
         callbacks.append(cp_callback)
@@ -238,8 +237,6 @@ if __name__ == "__main__":
     callbacks.append(lr_callback)
     callbacks.append(tb_callback)
     callbacks.append(hp_callback)
-    callbacks.append(epoch_callback)
-    # callbacks.append(temp_callback)
     tf.summary.experimental.set_step(0)
     # with pick_generator_train, pick_generator_test:
     with pick_generator_train:

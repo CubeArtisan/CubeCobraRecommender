@@ -1,33 +1,6 @@
 import tensorflow as tf
 
-from .timeseries.timeseries import log_timeseries
-
-
-def get_mask(tensor):
-    tensor._keras_mask = getattr(tensor, '_keras_mask', tf.cast(tf.ones_like(tensor), dtype=tf.bool))
-    # noinspection PyProtectedMember
-    return tensor._keras_mask
-
-
-def mask_to_zeros(tensor, name=None):
-    mask = get_mask(tensor)
-    if len(mask.shape) < len(tensor.shape):
-        mask = tf.expand_dims(mask, -1)
-    result = tensor * tf.cast(mask, dtype=tensor.dtype, name=name)
-    result._keras_mask = get_mask(tensor)
-    return result
-
-
-def cast(tensor, dtype, name=None):
-    result = tf.cast(tensor, dtype=dtype, name=name)
-    result._keras_mask = get_mask(tensor)
-    return result
-
-
-def normalize(tensor, axis=None, epsilon=1e-04, name=None):
-    result = tf.math.l2_normalize(tensor, axis=axis, epsilon=epsilon, name=name)
-    result._keras_mask = get_mask(tensor)
-    return result
+from src.ml.timeseries.timeseries import log_timeseries
 
 
 class DraftBot(tf.keras.models.Model):
@@ -41,12 +14,6 @@ class DraftBot(tf.keras.models.Model):
         self.l1_loss_weight = l1_loss_weight
         self.embed_dims = embed_dims
         self.num_heads = num_heads
-        self.oracle_weights = self.add_weight('oracle_weights', shape=(3, 15, 6), initializer='ones', trainable=True)
-        self.card_rating_logits = self.add_weight('card_rating_logits', shape=(num_cards,), initializer='random_uniform',
-                                                  trainable=True)
-        self.card_embeddings = self.add_weight('card_embeddings', shape=(num_cards, embed_dims),
-                                               initializer='random_uniform', trainable=True)
-        self.self_attention = tf.keras.layers.MultiHeadAttention(num_heads, embed_dims // num_heads, name='self_attention')
         self.loss_metric = tf.keras.metrics.Mean()
         self.log_loss_metric = tf.keras.metrics.Mean()
         self.l2_loss_metric = tf.keras.metrics.Mean()
@@ -58,6 +25,12 @@ class DraftBot(tf.keras.models.Model):
         # Our preprocessing guarantees that the human choice is always at index 0. Our calculations are permutation
         # invariant so this does not introduce any bias.
         self.default_target = tf.zeros((batch_size,), dtype=tf.int32)
+        self.oracle_weights = self.add_weight('oracle_weights', shape=(3, 15, 6), initializer='ones', trainable=True)
+        self.card_rating_logits = self.add_weight('card_rating_logits', shape=(num_cards,), initializer='random_uniform',
+                                                  trainable=True)
+        self.card_embeddings = self.add_weight('card_embeddings', shape=(num_cards, embed_dims),
+                                               initializer='random_uniform', trainable=True)
+        self.self_attention = tf.keras.layers.MultiHeadAttention(num_heads, embed_dims // num_heads, name='self_attention')
 
     def get_config(self):
         config = super(DraftBot, self).get_config()
@@ -133,7 +106,7 @@ class DraftBot(tf.keras.models.Model):
         option_scores = tf.einsum('bclo,bo->bcl', concat_option_scores, oracle_weights[:, :2])
         lands_scores = tf.einsum('blo,bo->bl', concat_lands_scores, oracle_weights[:, 2:])
         scores = option_scores + tf.expand_dims(lands_scores, 1)
-        # Here we compute softmax(logsumexp(scores, 2)) with the operations broken apart to allow optimizing the calculation.
+        # Here we compute softmax(logsumexp(scores, axis=2)) with the operations broken apart to allow optimizing the calculation.
         # Since logsumexp and softmax are translation invariant we shrink the scores so the max score is 0 to reduce numerical instability.
         max_scores = tf.stop_gradient(tf.reduce_max(scores, [1, 2], keepdims=True))
         # This is needed to allow masking out the positions without cards so they don't participate in the softmax or logsumexp computations.
