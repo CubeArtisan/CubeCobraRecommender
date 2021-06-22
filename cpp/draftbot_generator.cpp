@@ -192,15 +192,23 @@ private:
 
 struct DraftPickGenerator {
     using result_type = typename PyPickBatch::python_type;
+    static constexpr std::size_t read_buffer_count = (1ull << 18) / sizeof(PyPick); // 256 KB
+    static constexpr std::size_t shuffle_read_buffer_count = (1ull << 22) / sizeof(PyPick); // 4 MB
+    static constexpr std::size_t buffered_pick_count = (1ull << 32) / sizeof(PyPick); // 4 GB
+    static constexpr std::size_t shuffle_buffer_count = (1ull << 29) / sizeof(PyPick); // 512 MB
 
     DraftPickGenerator(std::size_t picks_per_batch, std::size_t num_readers, std::size_t num_shufflers,
-                       std::size_t num_batchers, std::size_t shuffle_buffer_length, std::size_t seed,
-                       std::string folder_path)
+                       std::size_t num_batchers, std::size_t seed, const std::string& folder_path)
             : batch_size(picks_per_batch), num_reader_threads{num_readers}, num_shuffler_threads{num_shufflers},
-              num_batch_threads{num_batchers}, shuffle_buffer_size{shuffle_buffer_length},
-              initial_seed{seed}, length{0}, files_to_read_producer{files_to_read},
-              loaded_batches_consumer{loaded_batches}, main_rng{initial_seed, num_shufflers} {
+              num_batch_threads{num_batchers},
+              initial_seed{seed}, length{0}, loaded_batches{buffered_pick_count / picks_per_batch},
+              files_to_read_producer{files_to_read}, loaded_batches_consumer{loaded_batches},
+              main_rng{initial_seed, num_readers + num_shufflers + num_batchers} {
         py::gil_scoped_release release;
+        std::cout << "\tbuffered_pick_count: " << buffered_pick_count << " in batches: " << buffered_pick_count / batch_size
+                  << "\n\tshuffle_buffer_count: " << shuffle_buffer_count
+                  << "\n\tread_buffer_count: " << read_buffer_count
+                  << "\n\tshuffle_read_buffer_count: " << shuffle_read_buffer_count << std::endl;
         std::vector<char> loaded_file_buffer;
         for (const auto& path_data : std::filesystem::directory_iterator(folder_path)) {
             draft_filenames.push_back(path_data.path().string());
@@ -224,15 +232,16 @@ struct DraftPickGenerator {
         py::gil_scoped_release release;
         if (exit_threads) {
             exit_threads = false;
+            queue_new_epoch();
             std::size_t thread_number = 0;
             for (std::size_t i=0; i < num_reader_threads; i++) {
-                reader_threads.emplace_back([this](){ this->read_worker(); });
+                reader_threads.emplace_back([this, j=thread_number++](){ this->read_worker(pcg32(this->initial_seed, j)); });
             }
             for (std::size_t i=0; i < num_shuffler_threads; i++) {
                 shuffler_threads.emplace_back([this, j=thread_number++](){ this->shuffle_worker(pcg32(this->initial_seed, j)); });
             }
             for (std::size_t i=0; i < num_batch_threads; i++) {
-                batch_threads.emplace_back([this](){ this->batch_worker(); });
+                batch_threads.emplace_back([this, j=thread_number++](){ this->batch_worker(pcg32(this->initial_seed, j)); });
             }
         }
         return *this;
@@ -246,19 +255,28 @@ struct DraftPickGenerator {
         return false;
     }
 
-    std::size_t size() const noexcept { return length / batch_size; }
+    std::size_t size() const noexcept { return (length + batch_size - 1) / batch_size; }
 
     DraftPickGenerator& queue_new_epoch() {
         std::shuffle(std::begin(draft_filenames), std::end(draft_filenames), main_rng);
         files_to_read.enqueue_bulk(files_to_read_producer, std::begin(draft_filenames), draft_filenames.size());
-        request_needed_work();
+        if (files_to_read.size_approx() > 0) request_needed_work();
         return *this;
     }
 
     result_type next() {
         std::unique_ptr<PyPickBatch> batched;
         request_needed_work();
-        while (!loaded_batches.wait_dequeue_timed(loaded_batches_consumer, batched, 10'000)) { }
+        if (!loaded_batches.try_dequeue(loaded_batches_consumer, batched)) {
+            py::gil_scoped_release gil_release;
+            do {
+                request_needed_work();
+                std::cout << "\nloaded_batches: " << loaded_batches.size_approx()
+                          << ", loaded_picks: " << loaded_picks.size_approx() << ", shuffled_picks: " << shuffled_picks.size_approx()
+                          << ", requested_picks: " << requested_picks << ", files_to_read: " << files_to_read.size_approx()
+                          << std::endl;
+            } while (!loaded_batches.wait_dequeue_timed(loaded_batches_consumer, batched, 10'000));
+        }
         PyPickBatch* batched_ptr = batched.release();
         py::capsule free_when_done(batched_ptr, [](void* ptr) { delete reinterpret_cast<PyPickBatch*>(ptr); });
         return batched_ptr->to_numpy(free_when_done);
@@ -268,11 +286,12 @@ struct DraftPickGenerator {
 
 private:
     void request_needed_work() {
-        std::size_t loaded_approx = batch_size * loaded_batches.size_approx() + requested_picks + loaded_picks.size_approx() / read_buffer_size;
-        if (loaded_approx < buffered_size) {
-            requested_picks = buffered_size - loaded_approx + num_reader_threads;
-            if (files_to_read.size_approx() == 0) queue_new_epoch();
+        std::size_t loaded_approx = batch_size * loaded_batches.size_approx() + loaded_picks.size_approx()
+                                     + shuffled_picks.size_approx();
+        if (loaded_approx < buffered_pick_count) {
+            requested_picks = (buffered_pick_count - loaded_approx + read_buffer_count - 1) / read_buffer_count;
         }
+        if (files_to_read.size_approx() < num_reader_threads) queue_new_epoch();
     }
 
     static const char* skip_record(const char* current_pos, const char* end_pos) noexcept {
@@ -288,19 +307,16 @@ private:
                               * (num_in_pack + num_picked + num_seen);
     }
 
-    static constexpr std::size_t read_buffer_size = 32;
-    static constexpr std::size_t buffered_size = (1ull << 33) / (sizeof(PyPick) * read_buffer_size); // 8 GB
-
-    void read_worker() {
-        static thread_local std::array<PyPick, read_buffer_size> picks_buffer;
+    void read_worker(pcg32 rng) {
+        std::vector<PyPick> picks_buffer(read_buffer_count);
+        std::uniform_int_distribution<std::size_t> sleep_for(10'000, 90'000);
         moodycamel::ConsumerToken files_to_read_consumer(files_to_read);
         moodycamel::ProducerToken loaded_picks_producer(loaded_picks);
         std::string cur_filename;
         std::vector<char> loaded_file_buffer;
         std::size_t current_index = 0;
         while (!exit_threads) {
-            std::size_t expected = requested_picks;
-            while (!exit_threads && !files_to_read.wait_dequeue_timed(files_to_read_consumer, cur_filename, 100'000)) { }
+            while (!exit_threads && !files_to_read.wait_dequeue_timed(files_to_read_consumer, cur_filename, 20 * sleep_for(rng))) { }
             if (!exit_threads) {
                 {
                     std::ifstream picks_file(cur_filename, std::ios::binary | std::ios::ate);
@@ -315,12 +331,14 @@ private:
                 while (skip_record(current_pos, end_pos) <= end_pos && !exit_threads) {
                     current_pos = picks_buffer[current_index++].load_from(current_pos);
                     if (current_index >= picks_buffer.size()) {
+                        std::size_t expected = requested_picks;
                         while (!exit_threads && (expected == 0 || requested_picks.compare_exchange_weak(expected, expected - 1))) {
                             if (expected == 0) {
-                                std::this_thread::sleep_for(std::chrono::microseconds(10'000));
+                                std::this_thread::sleep_for(std::chrono::microseconds(sleep_for(rng)));
                                 expected = requested_picks;
                             }
                         }
+                        if (exit_threads) return;
                         loaded_picks.enqueue_bulk(loaded_picks_producer, std::begin(picks_buffer), picks_buffer.size());
                         current_index = 0;
                     }
@@ -330,39 +348,45 @@ private:
     }
 
     void shuffle_worker(pcg32 rng) {
+        std::uniform_int_distribution<std::size_t> sleep_for(20'000, 180'000);
         moodycamel::ConsumerToken loaded_picks_consumer(loaded_picks);
         moodycamel::ProducerToken shuffled_picks_producer(shuffled_picks);
+        std::vector<PyPick> read_buffer;
+        read_buffer.reserve(shuffle_read_buffer_count);
         std::vector<PyPick> shuffle_buffer;
-        shuffle_buffer.reserve(shuffle_buffer_size);
-        std::uniform_int_distribution<std::size_t> index_selector(0, shuffle_buffer_size - 1);
-        while (shuffle_buffer.size() < shuffle_buffer_size && !exit_threads) {
-            PyPick loaded_pick;
-            if (loaded_picks.wait_dequeue_timed(loaded_picks_consumer, loaded_pick, 100'000)) {
-                shuffle_buffer.push_back(loaded_pick);
-            }
-        }
+        shuffle_buffer.reserve(shuffle_buffer_count);
+        while (!exit_threads && !loaded_picks.wait_dequeue_bulk_timed(loaded_picks_consumer, std::back_inserter(shuffle_buffer),
+                                                                      shuffle_buffer.capacity() - shuffle_buffer.size(), sleep_for(rng))) { }
+        std::shuffle(std::begin(shuffle_buffer), std::end(shuffle_buffer), rng);
+        std::uniform_int_distribution<std::size_t> index_selector(0, shuffle_buffer.size() - 1);
         while (!exit_threads) {
-            std::size_t index = index_selector(rng);
-            shuffled_picks.enqueue(shuffled_picks_producer, shuffle_buffer[index]);
-            while (!loaded_picks.wait_dequeue_timed(loaded_picks_consumer, shuffle_buffer[index], 100'000)
-                   && !exit_threads) { }
+            loaded_picks.wait_dequeue_bulk_timed(loaded_picks_consumer, std::back_inserter(read_buffer),
+                                                 read_buffer.capacity() - read_buffer.size(), sleep_for(rng));
+            if (!exit_threads && read_buffer.size() > 0) {
+                for (std::size_t i = 0; i < read_buffer.size(); i++) {
+                    std::swap(read_buffer[i], shuffle_buffer[index_selector(rng)]);
+                }
+                shuffled_picks.enqueue_bulk(shuffled_picks_producer, std::begin(read_buffer), read_buffer.size());
+                read_buffer.clear();
+            }
         }
     }
 
-    void batch_worker() {
+    void batch_worker(pcg32 rng) {
+        std::uniform_int_distribution<std::size_t> sleep_for(50'000, 350'000);
         moodycamel::ConsumerToken shuffled_picks_consumer(shuffled_picks);
         moodycamel::ProducerToken loaded_batches_producer(loaded_batches);
         while (!exit_threads) {
             std::unique_ptr<PyPickBatch> batch = std::make_unique<PyPickBatch>(batch_size);
             auto iter = batch->begin();
-            std::size_t remaining_size = batch->size();
-            while (!exit_threads && remaining_size > 0) {
-                std::size_t retrieved = shuffled_picks.wait_dequeue_bulk_timed(shuffled_picks_consumer, iter, remaining_size, 100'000);
-                iter += retrieved;
-                remaining_size -= retrieved;
+            const auto end_iter = batch->end();
+            while (!exit_threads && iter != end_iter) {
+                iter += shuffled_picks.wait_dequeue_bulk_timed(shuffled_picks_consumer, iter,
+                                                               std::distance(iter, end_iter), sleep_for(rng));
             }
-            if (exit_threads) return;
-            loaded_batches.enqueue(loaded_batches_producer, std::move(batch));
+            if (!exit_threads) {
+                loaded_batches.enqueue(loaded_batches_producer, std::move(batch));
+            }
         }
     }
 
@@ -370,7 +394,6 @@ private:
     std::size_t num_reader_threads;
     std::size_t num_shuffler_threads;
     std::size_t num_batch_threads;
-    std::size_t shuffle_buffer_size;
     std::size_t initial_seed;
 
     std::vector<std::string> draft_filenames;
@@ -395,12 +418,13 @@ private:
 PYBIND11_MODULE(draftbot_generator, m) {
     using namespace pybind11::literals;
     py::class_<DraftPickGenerator>(m, "DraftPickGenerator")
-        .def(py::init<std::size_t, std::size_t, std::size_t, std::size_t, std::size_t, std::size_t, std::string>())
+        .def(py::init<std::size_t, std::size_t, std::size_t, std::size_t, std::size_t, const std::string&>())
         .def("__enter__", &DraftPickGenerator::enter)
         .def("__exit__", &DraftPickGenerator::exit)
         .def("__len__", &DraftPickGenerator::size)
         .def("__getitem__", &DraftPickGenerator::getitem)
         .def("__next__", &DraftPickGenerator::next)
         .def("__iter__", &DraftPickGenerator::queue_new_epoch)
-        .def("on_epoch_end", &DraftPickGenerator::queue_new_epoch);
+        .def("on_epoch_end", &DraftPickGenerator::queue_new_epoch)
+        .def("queue_new_epoch", &DraftPickGenerator::queue_new_epoch);
 }
