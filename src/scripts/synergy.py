@@ -21,7 +21,7 @@ if __name__ == '__main__':
 
     print('Loading DraftBot model.')
     output_dir = f'././ml_files/{args.name}/'
-    draftbots = DraftBot(len(cards_json) + 1, 10, 1, embed_dims=args.embed_dims, num_heads=args.num_heads, name='DraftBots')
+    draftbots = DraftBot(len(cards_json) + 1, 1, embed_dims=args.embed_dims, num_heads=args.num_heads, name='DraftBots')
     latest = tf.train.latest_checkpoint(output_dir)
     draftbots.load_weights(latest)
 

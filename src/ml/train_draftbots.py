@@ -4,11 +4,9 @@ import json
 import locale
 import logging
 import os
-import shutil
 from pathlib import Path
 
 import tensorflow as tf
-import tensorflow_addons as tfa
 from tensorboard.plugins.hparams import api as hp
 from tensorboard.plugins import projector
 
@@ -97,7 +95,6 @@ if __name__ == "__main__":
     parser.add_argument('--compressed', action='store_true', help='Use the compressed version of the data to reduce disk usage.')
     parser.add_argument('--num-read-workers', '-jr', type=int, default=32, choices=[Range(1, 128)], help='The number of threads to use for loading data from disk.')
     parser.add_argument('--num-shuffle-workers', '-js', type=int, default=8, choices=[Range(1, 64)], help='The number of threads to use to shuffle the loaded picks.')
-    parser.add_argument('--num-batch-workers', '-jb', type=int, default=1, choices=[Range(1, 32)], help='The number of threads to use to batch together the picks.')
     parser.add_argument('--mlir', action='store_true', help='Enable MLIR passes on the data (EXPERIMENTAL).')
     parser.add_argument('--ragged', action='store_true', help='Enable loading from ragged datasets instead of dense.')
     profile_group = parser.add_mutually_exclusive_group()
@@ -169,7 +166,7 @@ if __name__ == "__main__":
     print('Creating the pick Datasets.')
     # pick_generator_train = DraftPickGenerator(args.batch_size, args.num_workers // 2, args.num_workers // 4, args.num_workers // 4,
     #                                           2 ** 16, args.seed, "data/parsed_picks/train_uncompressed/")
-    pick_generator_train = DraftPickGenerator(args.batch_size, args.num_read_workers, args.num_shuffle_workers, args.num_batch_workers, args.seed, "data/parsed_picks/full_uncompressed/")
+    pick_generator_train = DraftPickGenerator(args.batch_size, args.num_read_workers, args.num_shuffle_workers, args.seed, "data/parsed_picks/full_uncompressed/")
     print(f"There are {len(pick_generator_train):,} training batches")
     # pick_generator_test = DraftPickGenerator(args.batch_size, (3 * args.num_workers - 1) // 2, 1, args.num_workers // 4,
     #                                          2 ** 16, args.seed, "data/parsed_picks/test_uncompressed/")
@@ -180,10 +177,11 @@ if __name__ == "__main__":
     num_batches = len(pick_generator_train)
     tensorboard_period = num_batches // 128
     draftbots = DraftBot(len(card_ratings), args.batch_size, l1_loss_weight=args.l1_weight,
-                         l2_loss_weight=args.l2_weight, embed_dims=args.embed_dims, summary_period=tensorboard_period * 4,
+                         l2_loss_weight=args.l2_weight, embed_dims=args.embed_dims, summary_period=tensorboard_period * 64,
                          num_heads=args.num_heads, name='DraftBots')
     latest = tf.train.latest_checkpoint(output_dir)
-    opt = tfa.optimizers.LazyAdam(learning_rate=args.learning_rate or 0.001)
+    opt = tf.keras.optimizers.Adam(learning_rate=args.learning_rate or 0.001)
+    # opt = tfa.optimizers.LazyAdam(learning_rate=args.learning_rate or 0.001)
     if args.float_type == tf.float16:
         opt = tf.keras.mixed_precision.LossScaleOptimizer(opt, dynamic_growth_steps=num_batches // 128)
     if args.auto16:
@@ -222,9 +220,9 @@ if __name__ == "__main__":
     nan_callback = tf.keras.callbacks.TerminateOnNaN()
     es_callback = tf.keras.callbacks.EarlyStopping(monitor='accuracy', patience=30,
                                                    mode='max', restore_best_weights=True, verbose=True)
-    lr_callback = DynamicLearningRateCallback(monitor='accuracy', shrink_factor=0.95, grow_factor=1.1, mode='max',
-                                              patience_degrading=1, cooldown_degrading=2, patience_plateau=2,
-                                              cooldown_plateau=1, min_delta=5e-04, min_lr=1e-06, max_lr=1e-01, verbose=2)
+    lr_callback = DynamicLearningRateCallback(monitor='accuracy', shrink_factor=0.96, grow_factor=1.05, mode='max',
+                                              patience_degrading=1, cooldown_degrading=0, patience_plateau=1,
+                                              cooldown_plateau=0, min_delta=1e-03, min_lr=1e-06, max_lr=1e-01, verbose=2)
     tb_callback = TensorBoardFix(log_dir=log_dir, histogram_freq=1, write_graph=True,
                                  update_freq=tensorboard_period, embeddings_freq=1,
                                  profile_batch=0 if args.debug or not args.profile else (5 * num_batches // 4, 5 * num_batches // 4 + 64))
