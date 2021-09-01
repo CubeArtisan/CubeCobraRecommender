@@ -52,7 +52,7 @@ class DraftBot(tf.keras.models.Model):
         # self.dense_2_bias = self.add_weight('dense_2_bias', shape=(embed_dims * 4,), initializer='zeros', trainable=True)
         # self.dense_3_weight = self.add_weight('dense_3_weight', shape=(embed_dims * 4, 2 * embed_dims), initializer='random_normal', trainable=True)
         # self.dense_3_bias = self.add_weight('dense_3_bias', shape=(embed_dims * 2,), initializer='zeros', trainable=True)
-        # self.dense_4_weight = self.add_weight('dense_4_weight', shape=(embed_dims * 2, embed_dims), initializer='random_normal', trainable=True)
+        self.dense_4_weight = self.add_weight('dense_4_weight', shape=(embed_dims * 2, embed_dims), initializer='random_normal', trainable=True)
         self.dense_5_weight = self.add_weight('dense_5_weight', shape=(embed_dims, 2 * embed_dims), initializer='random_normal', trainable=True)
         self.dense_5_bias = self.add_weight('dense_5_bias', shape=(embed_dims * 2,), initializer='zeros', trainable=True)
         # self.dense_6_weight = self.add_weight('dense_6_weight', shape=(embed_dims * 2, 4 * embed_dims), initializer='random_normal', trainable=True)
@@ -147,38 +147,17 @@ class DraftBot(tf.keras.models.Model):
         return tf.math.softplus(tf.constant(1, dtype=self.compute_dtype) * self.oracle_weights)
         
     def call(self, inputs, training=False, mask=None):
-        use_probs = len(inputs) == 10
-        if use_probs:
-            in_pack_cards, seen_cards, seen_counts, picked_cards, picked_counts, coords, coord_weights, prob_seens,\
-                prob_pickeds, prob_in_packs = inputs
-            # We precalculate 8 land combinations that are heuristically verified to be likely candidates for highest scores
-            # and guarantee these combinations are diverse. To speed up computation we store the probabilities as unsigned
-            # 8-bit fixed-point integers this converts back to float
-            prob_seens = tf.cast(prob_seens, dtype=self.compute_dtype) / tf.constant(255, dtype=self.compute_dtype)
-            prob_pickeds = tf.cast(prob_pickeds, dtype=self.compute_dtype) / tf.constant(255, dtype=self.compute_dtype)
-            prob_in_packs = tf.cast(prob_in_packs, dtype=self.compute_dtype) / tf.constant(255, dtype=self.compute_dtype)
-        else:
-            in_pack_cards, seen_cards, picked_cards, coords, coord_weights = inputs
+        if len(inputs) == 10:
+            return 0
+        in_pack_cards, seen_cards, picked_cards, coords, coord_weights = inputs
         # Ratings are in the range (0, 1) so we use a sigmoid activation.
         # We gather before the sigmoid to make the gradient sparse over the ratings which helps with LazyAdam.
         in_pack_card_ratings = self._get_ratings(self.in_pack_rating_logits, training=training, name='in_pack_card_ratings')
         in_pack_ratings = tf.gather(in_pack_card_ratings, in_pack_cards, name='in_pack_ratings')
-        if use_probs:
-            picked_card_ratings = self._get_ratings(self.picked_rating_logits, training=training, name='picked_card_ratings')
-            picked_ratings = tf.gather(picked_card_ratings, picked_cards, name='picked_ratings')
-            seen_card_ratings = self._get_ratings(self.seen_rating_logits, training=training, name='seen_card_ratings')
-            seen_ratings = tf.gather(seen_card_ratings, seen_cards, name='seen_ratings')
         # We normalize here to allow computing the cosine similarity.
-        normalized_embeddings = tf.math.l2_normalize(self.card_embeddings, axis=1, epsilon=1e-04, name='normalized_card_embeds') * self.embed_mult
-        normalized_in_pack_embeds = tf.gather(normalized_embeddings, in_pack_cards, name='normalized_in_pack_embeds')
         in_pack_embeds = tf.gather(self.card_embeddings, in_pack_cards, name='in_pack_embeds')
-        if use_probs:
-            normalized_picked_embeds = tf.gather(normalized_embeddings, picked_cards, name='normalized_picked_embeds')
-            normalized_seen_embeds = tf.gather(normalized_embeddings, seen_cards,prob_seens, name='normalized_seen_embeds')
-            pool_embed = self._get_pool_embedding(picked_cards, prob_pickeds, training=training)
-        else:
-            pool_embed = self._get_pool_embedding_no_probs(picked_cards, training=training)
-            seen_embed = self._get_seen_embedding_no_probs(seen_cards, training=training)
+        pool_embed = self._get_pool_embedding_no_probs(picked_cards, training=training)
+        seen_embed = self._get_seen_embedding_no_probs(seen_cards, training=training)
         # We calculate the weight for each oracle as the linear interpolation of the weights on a 2d (3 x 15) grid.
         # There are 6 oracles so we can group them into one variable here for simplicity. The input coords are 4 points
         # on the 2d grid that we'll interpolate between. coord_weights is the weight for each of the four points.
@@ -190,48 +169,12 @@ class DraftBot(tf.keras.models.Model):
         # The pick synergy oracle for each card is the cosine similarity between its embedding and the pools embedding
         # times the cards casting probability.
         
-        if use_probs:
-            pick_synergy_scores_pre = (tf.einsum('ble,bce->blc', pool_embed, normalized_in_pack_embeds, name='pick_synergies_scores_pre')
-                                        + tf.constant(1, dtype=self.compute_dtype)) / tf.constant(2, dtype=self.compute_dtype)
-            pick_synergy_scores = (tf.einsum('blc,blc->bcl', pick_synergy_scores_pre, prob_in_packs, name='pick_synergy_scores'))
-            # The rating oracle for each card is its rating times its casting probability.
-            rating_scores = tf.einsum('bc,blc->bcl', in_pack_ratings, prob_in_packs, name='rating_scores')
-        else:
-            pick_synergy_scores = tf.nn.sigmoid(tf.einsum('be,bce->bc', pool_embed, in_pack_embeds, name='pick_synergy_scores'))
-            seen_synergy_scores = tf.nn.sigmoid(tf.einsum('be,bce->bc', seen_embed, in_pack_embeds, name='seen_synergy_scores'))
-            rating_scores = in_pack_ratings
-        if use_probs:
-            # The internal synergy oracle for a land configuration is the mean cosine similarity times casting probability
-            # of the cards that have been picked this draft.
-            reciprocal_picked_count = tf.constant(1, dtype=self.compute_dtype) / tf.math.maximum(tf.constant(1, dtype=self.compute_dtype), picked_counts)
-            internal_synergy_scores_pre = (tf.einsum('ble,bpe->blp', pool_embed, normalized_picked_embeds, name='internal_synergies_scores_pre')
-                                           + tf.constant(1, dtype=self.compute_dtype)) / tf.constant(2, dtype=self.compute_dtype)
-            internal_synergy_scores = (tf.einsum('blp,blp,b->bl', internal_synergy_scores_pre, prob_pickeds, reciprocal_picked_count, name='internal_synergy_scores'))
-            # These are per-land-configuration oracles that help choose between different land configurations.
-            # The colors oracle for a land configuration is the mean rating times casting probability of the cards in the pool.
-            colors_scores = tf.einsum('bp,blp,b->bl', picked_ratings, prob_pickeds, reciprocal_picked_count, name='colors_score')
-            # The seen synergy oracle for a land configuration is the mean cosine similarity times casting probability
-            # of the cards that have been seen this draft with cards that have been seen multiple times included multiple times.
-            reciprocal_seen_count = tf.constant(1, dtype=self.compute_dtype) / tf.math.maximum(tf.constant(1, dtype=self.compute_dtype), seen_counts)
-            # seen_synergy_scores_pre = (tf.einsum('ble,bse->bls', pool_embed, normalized_seen_embeds, name='seen_synergies_scores_pre')
-            #                            + tf.constant(1, dtype=self.compute_dtype)) / tf.constant(2, dtype=self.compute_dtype)
-            # seen_synergy_scores = (tf.einsum('bls,bls,b->bl', seen_synergy_scores_pre, prob_seens, reciprocal_seen_count, name='seen_synergy_scores'))
-            seen_synergy_scores = tf.zeros_like(colors_scores)
-            # The openness oracle for a land configuration is the mean rating times casting probability of the cards that
-            # have been seen this draft with cards that have been seen multiple times included multiple times.
-            openness_scores = tf.einsum('bs,bls,b->bl', seen_ratings, prob_seens, reciprocal_seen_count, name='openness_scores')
-            # Combine the oracle scores linearly according to the oracle weights to get a score for every card/land-configuration pair.
-            in_pack_scores = tf.einsum('bclo,bo->bcl', tf.stack([rating_scores, pick_synergy_scores], axis=3),
-                                       oracle_weights[:, 0:2], name='in_pack_scores')
-            picked_scores = tf.einsum('blo,bo->bl', tf.stack([colors_scores, internal_synergy_scores], axis=2),
-                                      oracle_weights[:, 2:4], name='picked_scores')
-            seen_scores = tf.einsum('blo,bo->bl', tf.stack([openness_scores, seen_synergy_scores], axis=2),
-                                    oracle_weights[:, 4:6], name='seen_scores')
-            scores = in_pack_scores + tf.expand_dims(picked_scores + seen_scores, 1)
-        else:
-            scores = tf.einsum('bco,bo->bc', tf.stack([rating_scores, pick_synergy_scores, seen_synergy_scores], axis=2),
-                               oracle_weights[:, 0:3], name='in_pack_scores')
-            scores = tf.expand_dims(scores, 2)
+        pick_synergy_scores = tf.nn.sigmoid(tf.einsum('be,bce->bc', pool_embed, in_pack_embeds, name='pick_synergy_scores'))
+        seen_synergy_scores = tf.nn.sigmoid(tf.einsum('be,bce->bc', seen_embed, in_pack_embeds, name='seen_synergy_scores'))
+        rating_scores = in_pack_ratings
+        scores = tf.einsum('bco,bo->bc', tf.stack([rating_scores, pick_synergy_scores, seen_synergy_scores], axis=2),
+                           oracle_weights[:, 0:3], name='in_pack_scores')
+        scores = tf.expand_dims(scores, 2)
         # Here we compute softmax(max(scores, axis=2)) with the operations broken apart to allow optimizing the calculation.
         # Since logsumexp and softmax are translation invariant we shrink the scores so the max score is 0 to reduce numerical instability.
         max_scores = tf.stop_gradient(tf.reduce_max(scores, [1, 2], keepdims=True, name='max_scores'))
@@ -239,10 +182,7 @@ class DraftBot(tf.keras.models.Model):
         # # Since the first operation of softmax is exp and the last of logsumexp is log we can combine them into a no-op.
         choice_probs = exp_scores / tf.math.reduce_sum(exp_scores, 1, keepdims=True, name='total_exp_scores')
 
-        if use_probs:
-            synergy_scores = tf.reduce_logsumexp(pick_synergy_scores[:, 0] * 16, 1) / 16
-        else:
-            synergy_scores = pick_synergy_scores[:, 0] + seen_synergy_scores[:, 0]
+        synergy_scores = pick_synergy_scores[:, 0] + seen_synergy_scores[:, 0]
         # This is all logging for tensorboard. It can't easily be factored into a separate function since it uses so many
         # local variables.
         if training and tf.summary.experimental.get_step() % self.summary_period == 0:
@@ -253,12 +193,8 @@ class DraftBot(tf.keras.models.Model):
             max_diff = max_score - min_score
             min_correct_prob = tf.math.reduce_min(choice_probs[:, 0])
             max_correct_prob = tf.math.reduce_max(choice_probs[:, 0])
-            if use_probs:
-                temperatures = tf.math.reduce_sum(oracle_weights_orig[:, :], axis=2)
-                relative_oracle_weights = oracle_weights_orig[:, :] / tf.expand_dims(temperatures, 2)
-            else:
-                temperatures = tf.math.reduce_sum(oracle_weights_orig[:, :, 0:3], axis=2)
-                relative_oracle_weights = oracle_weights_orig[:, :, 0:3] / tf.expand_dims(temperatures, 2)
+            temperatures = tf.math.reduce_sum(oracle_weights_orig[:, :, 0:3], axis=2)
+            relative_oracle_weights = oracle_weights_orig[:, :, 0:3] / tf.expand_dims(temperatures, 2)
             in_top_1 = tf.cast(tf.math.in_top_k(self.default_target, choice_probs, 1), tf.float32)
             in_top_2 = tf.cast(tf.math.in_top_k(self.default_target, choice_probs, 2), tf.float32)
             in_top_3 = tf.cast(tf.math.in_top_k(self.default_target, choice_probs, 3), tf.float32)
@@ -271,38 +207,23 @@ class DraftBot(tf.keras.models.Model):
 
             with tf.xla.experimental.jit_scope(compile_ops=False):
                 tf.summary.histogram('weights/card_ratings/in_pack', in_pack_card_ratings)
-                if use_probs:
-                    tf.summary.histogram('weights/card_ratings/picked', picked_card_ratings)
-                    tf.summary.histogram('weights/card_ratings/seen', seen_card_ratings)
                 log_timeseries(f'weights/oracles/temperature', temperatures, start_index=1)
-                if use_probs:
-                    oracle_details = (
-                        ('rating', 0, rating_scores, False),
-                        ('pick_synergy', 1, pick_synergy_scores, False),
-                        ('colors', 2, colors_scores, True),
-                        ('internal_synergy', 3, internal_synergy_scores, True),
-                        ('openness', 4, openness_scores, True),
-                        ('seen_synergy', 5, seen_synergy_scores, True)
-                    )
-                else:
-                    oracle_details = (
-                        ('rating', 0, rating_scores, True),
-                        ('pick_synergy', 1, pick_synergy_scores, True),
-                        ('seen_synergy', 2, seen_synergy_scores, True)
-                    )
-                for name, idx, values, expand in oracle_details:
+                oracle_details = (
+                    ('rating', 0, rating_scores),
+                    ('pick_synergy', 1, pick_synergy_scores),
+                    ('seen_synergy', 2, seen_synergy_scores)
+                )
+                for name, idx, values in oracle_details:
                     log_timeseries(f'weights/oracles/multiplier/{name}', oracle_weights_orig[:, :-1, idx], start_index=1)
                     log_timeseries(f'weights/oracles/relative/{name}', relative_oracle_weights[:, :, idx],
                                    start_index=1)
-                    if expand:
-                        values = tf.expand_dims(values, 1)
-                    diffs = tf.reduce_max(values, [1, 2]) - tf.math.reduce_min(values, [1, 2])
+                    diffs = tf.reduce_max(values, 1) - tf.math.reduce_min(values, 1)
                     diffs_with_temp = diffs * oracle_weights[:, idx]
                     relative_diffs = diffs_with_temp / max_diff
                     to_timeline(f'outputs/oracles/weighted_diffs/timeline/{name}', diffs_with_temp)
                     tf.summary.histogram(f'outputs/oracles/diffs/values/{name}', diffs)
                     to_timeline(f'outputs/oracles/relative/diffs/timeline/{name}', relative_diffs)
-                    tf.summary.histogram(f'outputs/oracles/values/{name}/correct', tf.math.reduce_max(values[:, 0], 1))
+                    tf.summary.histogram(f'outputs/oracles/values/{name}/correct', values[:, 0])
                 tf.summary.histogram(f'outputs/synergy_scores', synergy_scores)
                 tf.summary.histogram(f'outputs/scores/diffs/correct', tf.reduce_max(scores[:, 0], 1) - min_score)
                 tf.summary.histogram('outputs/scores/diffs', max_diff)
@@ -342,15 +263,13 @@ class DraftBot(tf.keras.models.Model):
         }
 
     def calculate_loss(self, data, training=False):
-        use_probs = len(data) == 10
         probs, synergy_scores = self(data, training=training)
         num_cards_in_pack = tf.reduce_sum(tf.cast(data[0] > 0, dtype=self.compute_dtype), 1)
         log_loss = tf.reduce_mean(-tf.math.log(probs[:, 0] + 1e-16) * num_cards_in_pack)
         prob_loss = -tf.reduce_mean(probs[:, 0] * num_cards_in_pack)
         synergy_loss = -tf.reduce_mean(synergy_scores)
         oracle_weights = self._get_weights(training=training)
-        if not use_probs:
-            oracle_weights = oracle_weights[:, :, 0:2]
+        oracle_weights = oracle_weights[:, :, 0:2]
         l1_loss = tf.math.reduce_mean(tf.math.abs(self.in_pack_rating_logits)
                                        + tf.math.abs(self.picked_rating_logits)
                                        + tf.math.abs(self.seen_rating_logits))
@@ -358,13 +277,9 @@ class DraftBot(tf.keras.models.Model):
                                        + self.picked_rating_logits * self.picked_rating_logits
                                        + self.seen_rating_logits * self.seen_rating_logits)
         loss = log_loss + self.l2_loss_weight * l2_loss + self.l1_loss_weight * l1_loss
-        #  + prob_loss
-#               + synergy_loss
         return loss, log_loss, l2_loss, l1_loss, synergy_loss, prob_loss, probs
 
     def train_step(self, data):
-        # filtered_data = data[0]
-        # filtered_data = (*data[0][:-3], tf.expand_dims(data[0][-3][:, 0], 1), tf.expand_dims(data[0][-2][:, 0], 1), tf.expand_dims(data[0][-1][:, 0], 1))
         filtered_data = [data[0][0], data[0][1], data[0][3], data[0][5], data[0][6]]
         with tf.GradientTape() as tape:
             loss, log_loss, l2_loss, l1_loss, synergy_loss, prob_loss, probs = self.calculate_loss(filtered_data, training=True)

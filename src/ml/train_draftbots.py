@@ -51,7 +51,7 @@ class GeneratorWrapper(tf.keras.utils.Sequence):
 
     def __getitem__(self, item):
         item = self.generator.__getitem__(item)
-        if self.training:
+        if False:
             num_seen = item[2]
             num_picked = item[4]
             for i, pair in enumerate(zip(num_seen, num_picked)):
