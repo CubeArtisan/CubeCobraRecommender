@@ -37,9 +37,9 @@ struct PyPick {
     float num_picked{0.f};
     std::array<std::array<std::int32_t, 2>, 4> coords{{{0, 0}}};
     std::array<float, 4> coord_weights{0.f};
-    std::array<std::array<std::uint8_t, MAX_SEEN>, NUM_LAND_COMBS> seen_probs{{{0}}};
-    std::array<std::array<std::uint8_t, MAX_PICKED>, NUM_LAND_COMBS> picked_probs{{{0}}};
-    std::array<std::array<std::uint8_t, MAX_IN_PACK>, NUM_LAND_COMBS> in_pack_probs{{{0}}};
+    std::array<std::uint8_t, MAX_SEEN * NUM_LAND_COMBS> seen_probs{0};
+    std::array<std::uint8_t, MAX_PICKED * NUM_LAND_COMBS> picked_probs{0};
+    std::array<std::uint8_t, MAX_IN_PACK * NUM_LAND_COMBS> in_pack_probs{0};
 
     bool load_from(std::ifstream& current_file) {
         std::array<char, (MAX_IN_PACK + MAX_SEEN + MAX_PICKED) * (NUM_LAND_COMBS + 2)> read_buffer;
@@ -69,9 +69,9 @@ struct PyPick {
             in_pack[i] = *reinterpret_cast<const std::uint16_t*>(current_pos);
             current_pos += sizeof(std::uint16_t);
         }
-        for (std::size_t i = 0; i < num_in_pack; i++) {
-            for (std::size_t j = 0; j < NUM_LAND_COMBS; j++) {
-                in_pack_probs[j][i] = *reinterpret_cast<const std::uint8_t*>(current_pos);
+		for (std::size_t i = 0; i < num_in_pack; i++) {
+			for (std::size_t j = 0; j < NUM_LAND_COMBS; j++) {
+                in_pack_probs[j * MAX_IN_PACK + i] = *reinterpret_cast<const std::uint8_t*>(current_pos);
                 current_pos += sizeof(std::uint8_t);
             }
         }
@@ -79,9 +79,9 @@ struct PyPick {
             picked[i] = *reinterpret_cast<const std::uint16_t*>(current_pos);
             current_pos += sizeof(std::uint16_t);
         }
-        for (std::size_t i = 0; i < num_picked; i++) {
-            for (std::size_t j = 0; j < NUM_LAND_COMBS; j++) {
-                picked_probs[j][i] = *reinterpret_cast<const std::uint8_t*>(current_pos);
+		for (std::size_t i = 0; i < num_picked; i++) {
+			for (std::size_t j = 0; j < NUM_LAND_COMBS; j++) {
+                picked_probs[j * MAX_PICKED + i] = *reinterpret_cast<const std::uint8_t*>(current_pos);
                 current_pos += sizeof(std::uint8_t);
             }
         }
@@ -89,9 +89,9 @@ struct PyPick {
             seen[i] = *reinterpret_cast<const std::uint16_t*>(current_pos);
             current_pos += sizeof(std::uint16_t);
         }
-        for (std::size_t i = 0; i < num_seen; i++) {
-            for (std::size_t j = 0; j < NUM_LAND_COMBS; j++) {
-                seen_probs[j][i] = *reinterpret_cast<const std::uint8_t*>(current_pos);
+		for (std::size_t i = 0; i < num_seen; i++) {
+			for (std::size_t j = 0; j < NUM_LAND_COMBS; j++) {
+                seen_probs[j * MAX_SEEN + i] = *reinterpret_cast<const std::uint8_t*>(current_pos);
                 current_pos += sizeof(std::uint8_t);
             }
         }
@@ -130,9 +130,9 @@ struct PyPickBatch {
     // static constexpr std::array<std::size_t, 3> seen_probs_strides{ sizeof(PyPick), sizeof(std::array<float, MAX_SEEN>), sizeof(float) };
     // static constexpr std::array<std::size_t, 3> picked_probs_strides{ sizeof(PyPick), sizeof(std::array<float, MAX_PICKED>), sizeof(float) };
     // static constexpr std::array<std::size_t, 3> in_pack_probs_strides{ sizeof(PyPick), sizeof(std::array<float, MAX_IN_PACK>), sizeof(float) };
-    static constexpr std::array<std::size_t, 3> seen_probs_strides{ sizeof(PyPick), sizeof(std::array<std::uint8_t, MAX_SEEN>), sizeof(std::uint8_t) };
-    static constexpr std::array<std::size_t, 3> picked_probs_strides{ sizeof(PyPick), sizeof(std::array<std::uint8_t, MAX_PICKED>), sizeof(std::uint8_t) };
-    static constexpr std::array<std::size_t, 3> in_pack_probs_strides{ sizeof(PyPick), sizeof(std::array<std::uint8_t, MAX_IN_PACK>), sizeof(std::uint8_t) };
+    static constexpr std::array<std::size_t, 3> seen_probs_strides{ sizeof(PyPick), sizeof(std::uint8_t) * MAX_SEEN, sizeof(std::uint8_t) };
+    static constexpr std::array<std::size_t, 3> picked_probs_strides{ sizeof(PyPick), sizeof(std::uint8_t) * MAX_PICKED, sizeof(std::uint8_t) };
+    static constexpr std::array<std::size_t, 3> in_pack_probs_strides{ sizeof(PyPick), sizeof(std::uint8_t) * MAX_IN_PACK, sizeof(std::uint8_t) };
 
     constexpr std::size_t size() const noexcept { return batch_size; }
 

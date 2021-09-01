@@ -4,8 +4,10 @@ import json
 import locale
 import logging
 import os
+import random
 from pathlib import Path
 
+import numpy as np
 import tensorflow as tf
 import tensorflow_addons as tfa
 from tensorboard.plugins.hparams import api as hp
@@ -42,11 +44,29 @@ class TensorBoardFix(tf.keras.callbacks.TensorBoard):
 
 
 class GeneratorWrapper(tf.keras.utils.Sequence):
-    def __init__(self, generator):
+    def __init__(self, generator, num_cards, training=False):
         self.generator = generator
+        self.num_cards = num_cards
+        self.training = training
 
     def __getitem__(self, item):
-        return (self.generator.__getitem__(item),)
+        item = self.generator.__getitem__(item)
+        if self.training:
+            num_seen = item[2]
+            num_picked = item[4]
+            for i, pair in enumerate(zip(num_seen, num_picked)):
+                seen_count, picked_count = pair
+                seen_count = int(seen_count)
+                picked_count = int(picked_count)
+                idxs = list(range(seen_count))
+                random.shuffle(idxs)
+                for idx in idxs[:seen_count // 2]:
+                    item[1][i][idx] = random.randrange(self.num_cards)
+                idxs = list(range(picked_count))
+                random.shuffle(idxs)
+                for idx in idxs[:picked_count // 2]:
+                    item[3][i][idx] = random.randrange(self.num_cards)
+        return (item,)
 
     def __len__(self):
         return len(self.generator)
@@ -148,7 +168,7 @@ if __name__ == "__main__":
     print('Loading card data for seeding weights.')
     with open('data/maps/int_to_card.json', 'r') as cards_file:
         cards_json = json.load(cards_file)
-        card_ratings = [0] + [10 ** ((c.get('elo', 1200) / 800) - 2) for c in cards_json]
+        card_ratings = [-1] + [(c.get('elo', 1200) / 1200) - 1  for c in cards_json]
         blank_embedding = [1 for _ in range(64)]
         card_names = [''] + [c['name'] for c in cards_json]
 
@@ -166,94 +186,131 @@ if __name__ == "__main__":
     projector.visualize_embeddings(log_dir, projector_config)
 
     print('Creating the pick Datasets.')
-    # pick_generator_train = DraftPickGenerator(args.batch_size, args.num_workers // 2, args.num_workers // 4, args.num_workers // 4,
-    #                                           2 ** 16, args.seed, "data/parsed_picks/train_uncompressed/")
-    pick_generator_train = DraftPickGenerator(args.batch_size, args.num_workers, args.seed, "data/parsed_picks/full_uncompressed/")
+    pick_generator_train = DraftPickGenerator(args.batch_size, args.num_workers, args.seed, "data/parsed_picks/training/")
     print(f"There are {len(pick_generator_train):,} training batches")
-    # pick_generator_test = DraftPickGenerator(args.batch_size, (3 * args.num_workers - 1) // 2, 1, args.num_workers // 4,
-    #                                          2 ** 16, args.seed, "data/parsed_picks/test_uncompressed/")
-    # print(f"There are {len(pick_generator_test):,} testing batches")
+    pick_generator_test = DraftPickGenerator(args.batch_size, args.num_workers // 2, args.seed, "data/parsed_picks/validation/")
+    print(f"There are {len(pick_generator_test):,} validation batches")
     print('Loading DraftBot model.')
     output_dir = f'././ml_files/{args.name}/'
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     num_batches = len(pick_generator_train)
-    tensorboard_period = num_batches // 16
-    draftbots = DraftBot(len(card_ratings), args.batch_size, l1_loss_weight=args.l1_weight,
+    tensorboard_period = num_batches // 64
+    random_embeddings = np.ones((len(card_ratings), args.embed_dims)) / 8
+    for i, _ in enumerate(card_ratings):
+        for _ in range(8):
+            j = random.randrange(args.embed_dims)
+            random_embeddings[i, j] = -1
+    random_embeddings[0] = 0
+    draftbots = DraftBot(card_ratings, random_embeddings, args.batch_size, l1_loss_weight=args.l1_weight,
                          l2_loss_weight=args.l2_weight, embed_dims=args.embed_dims, summary_period=tensorboard_period * 16,
                          num_heads=args.num_heads, name='DraftBots')
     latest = tf.train.latest_checkpoint(output_dir)
-    # opt = tf.keras.optimizers.Adam(learning_rate=args.learning_rate or 0.001)
-    # opt = tf.keras.optimizers.Adamax(learning_rate=args.learning_rate or 0.001)
-    # opt = tfa.optimizers.LazyAdam(learning_rate=args.learning_rate or 0.001)
-    # opt = tfa.optimizers.RectifiedAdam(learning_rate=args.learning_rate or 0.001)
-    opt = tfa.optimizers.NovoGrad(learning_rate=args.learning_rate or 0.001)
-    # opt = tfa.optimizers.LAMB(learning_rate=args.learning_rate or 0.001)
+    
+    
+    class ExponentialCyclingLearningRate(tf.keras.optimizers.schedules.LearningRateSchedule):
+        def __init__(self, maximal_learning_rate=32e-03, minimal_learning_rate=1e-03, decrease_steps=61440, increase_steps=8192):
+            self.maximal_learning_rate = tf.constant(maximal_learning_rate, dtype=tf.float32)
+            self.minimal_learning_rate = tf.constant(minimal_learning_rate, dtype=tf.float32)
+            self.cycle_steps = decrease_steps + increase_steps
+            self.decreasing_rate = tf.constant((minimal_learning_rate / maximal_learning_rate) ** (1 / decrease_steps), dtype=tf.float32)
+            self.increasing_rate = tf.constant((maximal_learning_rate / minimal_learning_rate) ** (1 / increase_steps), dtype=tf.float32)
+            self.increase_steps = increase_steps
+            self.decrease_steps = decrease_steps
+            
+            
+        def __call__(self, step):
+            with tf.name_scope("CyclicalLearningRate"):
+                cycle_pos = step % self.cycle_steps
+                lr = tf.cond(cycle_pos >= self.increase_steps,
+                             lambda: self.maximal_learning_rate * (self.decreasing_rate ** tf.cast((cycle_pos - self.increase_steps) % self.decrease_steps, dtype=tf.float32)),
+                             lambda: self.minimal_learning_rate * (self.increasing_rate ** tf.cast(cycle_pos, dtype=tf.float32)))
+                tf.summary.scalar('learning_rate', lr)
+                return lr
+
+    learning_rate = args.learning_rate or 0.001
+    learning_rate = ExponentialCyclingLearningRate(maximal_learning_rate=learning_rate, minimal_learning_rate=learning_rate / 64,
+                                                   decrease_steps=num_batches * (args.epochs - 1), increase_steps=num_batches)
+    opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+    # opt = tf.keras.optimizers.Adamax(learning_rate=learning_rate)
+    # opt = tfa.optimizers.LazyAdam(learning_rate=learning_rate)
+    # opt = tfa.optimizers.RectifiedAdam(learning_rate=learning_rate)
+    # opt = tfa.optimizers.NovoGrad(learning_rate=learning_rate)
+    # opt = tfa.optimizers.LAMB(learning_rate=learning_rate)
+    # opt = tfa.optimizers.Lookahead(opt, sync_period=16, slow_step_size=0.5)
     if args.float_type == tf.float16:
         opt = tf.keras.mixed_precision.LossScaleOptimizer(opt, dynamic_growth_steps=num_batches // 128)
     if args.auto16:
         print("WARNING 16 bit rewrite mode can cause numerical instabilities.")
         tf.compat.v1.mixed_precision.enable_mixed_precision_graph_rewrite(opt)
-    draftbots.compile(optimizer=opt)
     if latest is not None:
         print('Loading Checkpoint.')
+        # draftbots.load_weights(latest)
+        # draftbots.compile()
+        # draftbots.save_weights(latest)
+        # draftbots = DraftBot(card_ratings, random_embeddings, args.batch_size, l1_loss_weight=args.l1_weight,
+        #                      l2_loss_weight=args.l2_weight, embed_dims=args.embed_dims, summary_period=tensorboard_period * 16,
+        #                      num_heads=args.num_heads, name='DraftBots')
         draftbots.load_weights(latest)
         # if args.learning_rate:
             # tf.keras.backend.set_value(draftbots.optimizer.lr, args.learning_rate)
+    # tf.keras.backend.set_value(draftbots.oracle_weights, [[[5, 10, 40, 40, 20, 20] for _ in range(15)] for _ in range(3)])
+    draftbots.compile(optimizer=opt)
     hparams = {
         HP_BATCH_SIZE: args.batch_size,
-        HP_LEARNING_RATE: args.learning_rate,
+        HP_LEARNING_RATE: args.learning_rate or 0.001,
         HP_EMBED_DIMS: args.embed_dims, HP_L2_WEGIHT: args.l2_weight, HP_NUM_HEADS: args.num_heads,
     }
 
     print('Starting training')
     callbacks = []
-    mcp_callback = tf.keras.callbacks.ModelCheckpoint(
-        filepath=output_dir + 'model',
-        monitor='accuracy',
-        verbose=False,
-        save_best_only=True,
-        save_weights_only=True,
-        mode='max',
-        save_freq='epoch')
-    cp_callback = tf.keras.callbacks.ModelCheckpoint(
-        filepath=log_dir + '/model-{epoch:04d}.ckpt',
-        monitor='loss',
-        verbose=False,
-        save_best_only=False,
-        save_weights_only=True,
-        mode='min',
-        save_freq='epoch')
-    nan_callback = tf.keras.callbacks.TerminateOnNaN()
-    es_callback = tf.keras.callbacks.EarlyStopping(monitor='accuracy', patience=30,
-                                                   mode='max', restore_best_weights=True, verbose=True)
-    ts_callback = tfa.callbacks.TimeStopping((args.runtime or 1) * 60)
-    lr_callback = DynamicLearningRateCallback(monitor='accuracy', shrink_factor=0.96, grow_factor=1.05, mode='max',
-                                              patience_degrading=1, cooldown_degrading=0, patience_plateau=1,
-                                              cooldown_plateau=0, min_delta=1e-03, min_lr=1e-06, max_lr=1e-01, verbose=2)
-    tb_callback = TensorBoardFix(log_dir=log_dir, histogram_freq=1, write_graph=True,
-                                 update_freq=tensorboard_period, embeddings_freq=1,
-                                 profile_batch=0 if args.debug or not args.profile else (5 * num_batches // 4, 5 * num_batches // 4 + 64))
-    hp_callback = hp.KerasCallback(log_dir, hparams)
     if not args.debug:
+        mcp_callback = tf.keras.callbacks.ModelCheckpoint(
+            filepath=output_dir + 'model',
+            monitor='accuracy',
+            verbose=False,
+            save_best_only=True,
+            save_weights_only=True,
+            mode='max',
+            save_freq='epoch')
+        cp_callback = tf.keras.callbacks.ModelCheckpoint(
+            filepath=log_dir + '/model-{epoch:04d}.ckpt',
+            monitor='loss',
+            verbose=False,
+            save_best_only=False,
+            save_weights_only=True,
+            mode='min',
+            save_freq='epoch')
         callbacks.append(mcp_callback)
         callbacks.append(cp_callback)
+    if args.runtime:
+        ts_callback = tfa.callbacks.TimeStopping(args.runtime * 60)
+        callbacks.append(ts_callback)
+    nan_callback = tf.keras.callbacks.TerminateOnNaN()
+    es_callback = tf.keras.callbacks.EarlyStopping(monitor='accuracy', patience=16,
+                                                   mode='max', restore_best_weights=True, verbose=True)
+    lr_callback = DynamicLearningRateCallback(monitor='accuracy', shrink_factor=0.99, grow_factor=1.05, mode='max',
+                                              patience_degrading=1, cooldown_degrading=0, patience_plateau=1,
+                                              cooldown_plateau=0, min_delta=1e-03, min_lr=1e-04, max_lr=1e-00, verbose=2)
+    tb_callback = TensorBoardFix(log_dir=log_dir, histogram_freq=1, write_graph=True,
+                                 update_freq=tensorboard_period, embeddings_freq=None,
+                                 profile_batch=0 if args.debug or not args.profile else (5 * num_batches // 4, 5 * num_batches // 4 + 64))
+    hp_callback = hp.KerasCallback(log_dir, hparams)
     callbacks.append(nan_callback)
     # callbacks.append(es_callback)
-    if args.runtime:
-        callbacks.append(ts_callback)
     # callbacks.append(lr_callback)
     callbacks.append(tb_callback)
     callbacks.append(hp_callback)
     tf.summary.experimental.set_step(0)
     # with pick_generator_train, pick_generator_test:
     with pick_generator_train:
-        draftbots.fit(
-            GeneratorWrapper(pick_generator_train),
-            # validation_data=GeneratorWrapper(pick_generator_test),
-            epochs=args.epochs,
-            callbacks=callbacks,
-            verbose=1
-        )
+        with pick_generator_test:
+            draftbots.fit(
+                GeneratorWrapper(pick_generator_train, len(card_ratings), True),
+                validation_data=GeneratorWrapper(pick_generator_test, len(card_ratings), False),
+                epochs=args.epochs,
+                callbacks=callbacks,
+                verbose=1
+            )
     if not args.debug:
         print('Saving final model.')
         Path(f'{output_dir}/final').mkdir(parents=True, exist_ok=True)
