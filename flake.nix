@@ -1,14 +1,10 @@
 {
   inputs = {
     flake-utils.url = "github:numtide/flake-utils";
-    mach_nix = {
-      url = "github:DavHau/mach-nix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
   };
 
-  outputs = { nixpkgs, mach-nix, flake-utils, ... }:
+  outputs = { nixpkgs, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem
       (system:
       let
@@ -16,7 +12,7 @@
           inherit system;
           config.allowUnfree = true;
         };
-        venvDir = "./.venv2";
+        venvDir = "./.venv";
         defaultShellPath = pkgs.lib.makeBinPath [ pkgs.bash pkgs.coreutils pkgs.findutils pkgs.gnugrep pkgs.gnused pkgs.which ];
         cacheRequirements = pkgs.lib.readFile ./requirements.txt;
       in
@@ -25,30 +21,38 @@
             name = "CubeCobraRecommender";
             buildInputs = [
               pkgs.stdenv.cc.cc.lib
-              pkgs.cudnn_cudatoolkit_11_0
-              pkgs.cudaPackages.cudatoolkit_11_0
+              pkgs.cudaPackages.cudatoolkit_11
+              pkgs.cutensor_cudatoolkit_11_2
+              pkgs.cudnn_cudatoolkit_11_2
               pkgs.linuxPackages.nvidia_x11
-              pkgs.python38Packages.python
+              pkgs.python39Packages.python
             ];
 
             shellHook = ''
-              export LD_LIBRARY_PATH=${pkgs.cudatoolkit_11_0}/lib:${pkgs.cudnn_cudatoolkit_11_0}/lib:${pkgs.cudatoolkit_11_0.lib}/lib:${pkgs.linuxPackages.nvidia_x11}/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH
+              export CUDATOOLKIT=${pkgs.cudaPackages.cudatoolkit_11}
+              export CUDATOOLKIT_LIB=${pkgs.cudaPackages.cudatoolkit_11.lib}
+              export CUDNN=${pkgs.cudnn_cudatoolkit_11_2}
+              export CUTENSOR=${pkgs.cutensor_cudatoolkit_11_2}
+              export LD_LIBRARY_PATH=${pkgs.cudaPackages.cudatoolkit_11}/lib:${pkgs.cudaPackages.cudatoolkit_11.lib}/lib:$LD_LIBRARY_PATH
+              export LD_LIBRARY_PATH=${pkgs.cudnn_cudatoolkit_11_2}/lib:${pkgs.cutensor_cudatoolkit_11_2}/lib:$LD_LIBRARY_PATH
+              export LD_LIBRARY_PATH=${pkgs.linuxPackages.nvidia_x11}/lib:${pkgs.stdenv.cc.cc.lib}/lib:$LD_LIBRARY_PATH
               export CC=/usr/bin/gcc
               SOURCE_DATE_EPOCH=$(date +%s)
 
               if [ ! -d "${venvDir}" ]; then
                 echo "Creating new venv environment in path: '${venvDir}'"
-                # Note that the module venv was only introduced in python 3, so for 2.7
-                # this needs to be replaced with a call to virtualenv
-                ${pkgs.python38Packages.python.interpreter} -m venv "${venvDir}"
+                ${pkgs.python39Packages.python.interpreter} -m venv "${venvDir}"
+                source "${venvDir}/bin/activate"
                 pip install --upgrade wheel setuptools pip
+                pip install -r requirements.txt
+              else
+                source "${venvDir}/bin/activate"
               fi
 
               # Under some circumstances it might be necessary to add your virtual
               # environment to PYTHONPATH, which you can do here too;
               # export PYTHONPATH=$PWD/${venvDir}/${pkgs.python38Packages.python.sitePackages}/:$PYTHONPATH
 
-              source "${venvDir}/bin/activate"
 
               unset SOURCE_DATE_EPOCH
             '';
