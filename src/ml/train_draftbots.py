@@ -26,7 +26,7 @@ NUM_HEAD_CHOICES = tuple(2 ** i for i in range(6))
 HP_BATCH_SIZE = hp.HParam('batch_size', hp.Discrete(BATCH_CHOICES))
 HP_EMBED_DIMS = hp.HParam('embedding_dimensions', hp.Discrete(EMBED_DIMS_CHOICES))
 HP_LEARNING_RATE = hp.HParam('learning_rate', hp.RealInterval(1e-06, 1e+05))
-HP_L2_WEGIHT = hp.HParam('l2_loss_weight', hp.RealInterval(0.0, 1.0))
+HP_RATING_L2_WEGIHT = hp.HParam('l2_loss_weight', hp.RealInterval(0.0, 1.0))
 HP_NUM_HEADS = hp.HParam('num_heads', hp.Discrete(NUM_HEAD_CHOICES))
 
 
@@ -90,6 +90,27 @@ class Range(object):
     def __repr__(self):
         return str(self)
 
+    
+class ExponentialCyclingLearningRate(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, maximal_learning_rate=32e-03, minimal_learning_rate=1e-03, decrease_steps=61440, increase_steps=8192):
+        self.maximal_learning_rate = tf.constant(maximal_learning_rate, dtype=tf.float32)
+        self.minimal_learning_rate = tf.constant(minimal_learning_rate, dtype=tf.float32)
+        self.cycle_steps = decrease_steps + increase_steps
+        self.decreasing_rate = tf.constant((minimal_learning_rate / maximal_learning_rate) ** (1 / decrease_steps), dtype=tf.float32)
+        self.increasing_rate = tf.constant((maximal_learning_rate / minimal_learning_rate) ** (1 / increase_steps), dtype=tf.float32)
+        self.increase_steps = increase_steps
+        self.decrease_steps = decrease_steps
+        
+        
+    def __call__(self, step):
+        with tf.name_scope("CyclicalLearningRate"):
+            cycle_pos = step % self.cycle_steps
+            lr = tf.cond(cycle_pos >= self.increase_steps,
+                         lambda: self.maximal_learning_rate * (self.decreasing_rate ** tf.cast((cycle_pos - self.increase_steps) % self.decrease_steps, dtype=tf.float32)),
+                         lambda: self.minimal_learning_rate * (self.increasing_rate ** tf.cast(cycle_pos, dtype=tf.float32)))
+            tf.summary.scalar('learning_rate', lr)
+            return lr
+
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
@@ -99,29 +120,31 @@ if __name__ == "__main__":
     parser.add_argument('--batch-size', '-b', type=int, required=True, help="The batch size to train over.")
     parser.add_argument('--learning-rate', '-l', type=float, default=None, choices=[Range(1e-06, 1e+05)], help="The initial learning rate to train with.")
     parser.add_argument('--embed-dims', '-d', type=int, default=16, choices=EMBED_DIMS_CHOICES, help="The number of dimensions to use for card embeddings.")
-    parser.add_argument('--l2-weight', '-l2', type=float, default=1e-04, help='The relative weight of the l2 regularization on the oracle weight logits that pulls them towards 0.')
-    parser.add_argument('--l1-weight', '-l1', type=float, default=1e-05, help='The relative weight of the l1 regularization on the temperature that pulls it towards 0.')
-    parser.add_argument('--num-heads', type=int, default=16, help='The number of heads to use for the self attention layer.')
+    parser.add_argument('--seen-dims', type=int, default=16, choices=EMBED_DIMS_CHOICES, help='The number of dimensions to use for seen card embeddings.')
+    parser.add_argument('--picked-dims', type=int, default=16, choices=EMBED_DIMS_CHOICES, help='The number of dimensions to use for picked card embeddings.')
+    parser.add_argument('--rating-l2-weight', type=float, default=0.0, help='The relative weight of the l2 regularization on the rating logits that pulls them towards 0.')
+    parser.add_argument('--rating-l1-weight', type=float, default=0.0, help='The relative weight of the l1 regularization on the ratings that pulls them towards 0.')
+    parser.add_argument('--dropout-picked', type=float, default=0.0, help='The percent of cards to drop from picked when calculating the pool embedding.')
+    parser.add_argument('--dropout-seen', type=float, default=0.0, help='The percent of cards to drop from picked when calculating the seen embedding.')
+    parser.add_argument('--dropout-dense', type=float, default=0.0, help='The percent of values to drop from the dense layers when calculating pool/seen embeddings.')
     parser.add_argument('--seed', type=int, default=37, help='The random seed to initialize things with to improve reproducibility.')
     parser.add_argument('--runtime', type=int, default=None, help='Number of minutes to train for.')
+    parser.add_argument('--oracle-stddev-weight', type=float, default=0.0, help='The relative weight of the loss based on stddev of the oracles. This encourages oracles to have diverse values.')
     float_type_group = parser.add_mutually_exclusive_group()
     float_type_group.add_argument('-16', dest='float_type', const=tf.float16, action='store_const', help='Use 16 bit numbers throughout the model.')
     float_type_group.add_argument('--auto16', '-16rw', action='store_true', help='Automatically rewrite some operations to use 16 bit numbers.')
     float_type_group.add_argument('--keras16', '-16k', action='store_true', help='Have Keras automatically convert the synergy calculations to 16 bit.')
     float_type_group.add_argument('-32', dest='float_type', const=tf.float32, action='store_const', help='Use 32 bit numbers (the default) throughout the model.')
     float_type_group.add_argument('-64', dest='float_type', const=tf.float64, action='store_const', help='Use 64 bit numbers throughout the model.')
-    parser.add_argument('--debug', action='store_true', help='Enable debug dumping of tensor stats.')
     xla_group = parser.add_mutually_exclusive_group()
     xla_group.add_argument('--xla', action='store_true', dest='use_xla', help='Enable using xla to optimize the model (the default).')
     xla_group.add_argument('--no-xla', action='store_false', dest='use_xla', help='Disable using xla to optimize the model.')
-    parser.add_argument('--compressed', action='store_true', help='Use the compressed version of the data to reduce disk usage.')
-    parser.add_argument('--num-workers', '-j', type=int, default=32, choices=[Range(1, 128)], help='The number of threads to use for loading data from disk.')
+    parser.add_argument('--debug', action='store_true', help='Enable debug dumping of tensor stats.')
     parser.add_argument('--mlir', action='store_true', help='Enable MLIR passes on the data (EXPERIMENTAL).')
-    parser.add_argument('--ragged', action='store_true', help='Enable loading from ragged datasets instead of dense.')
-    profile_group = parser.add_mutually_exclusive_group()
-    profile_group.add_argument('--profile', action='store_true', help='Enable profiling a range of batches from the first epoch.')
-    profile_group.add_argument('--no-profile', action='store_false', dest='profile', help='Disable profiling a range of batches from the first epoch (the default).')
-    parser.set_defaults(float_type=tf.float32, use_xla=True, profile=False)
+    parser.add_argument('--profile', action='store_true', help='Enable profiling a range of batches from the first epoch.')
+    parser.add_argument('--num-workers', '-j', type=int, default=32, choices=[Range(1, 128)], help='The number of threads to use for loading data from disk.')
+    parser.add_argument('--starting-step', type=int, default=0, help='The starting step number in batches.')
+    parser.set_defaults(float_type=tf.float32, use_xla=True)
     args = parser.parse_args()
 
     log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -163,7 +186,7 @@ if __name__ == "__main__":
         'min_graph_nodes': 1,
     })
     tf.config.threading.set_intra_op_parallelism_threads(32)
-    tf.config.threading.set_inter_op_parallelism_threads(64)
+    tf.config.threading.set_inter_op_parallelism_threads(32)
 
     print('Loading card data for seeding weights.')
     with open('data/maps/int_to_card.json', 'r') as cards_file:
@@ -178,55 +201,22 @@ if __name__ == "__main__":
         f.write('0\t"PlaceholderForTraining"\tN/A\tN/A\n')
         for i, card in enumerate(cards_json):
             f.write(f'{i+1}\t"{card["name"]}"\t{"".join(sorted(card.get("color_identity")))}\t{card.get("type")}\n')
-    projector_config = projector.ProjectorConfig()
-    projector_config.model_checkpoint_dir = './'
-    embedding = projector_config.embeddings.add()
-    embedding.tensor_name = "card_embeddings/.ATTRIBUTES/VARIABLE_VALUE"
-    embedding.metadata_path = 'metadata.tsv'
-    projector.visualize_embeddings(log_dir, projector_config)
 
     print('Creating the pick Datasets.')
     pick_generator_train = DraftPickGenerator(args.batch_size, args.num_workers, args.seed, "data/parsed_picks/training/")
     print(f"There are {len(pick_generator_train):,} training batches")
-    pick_generator_test = DraftPickGenerator(args.batch_size, args.num_workers // 2, args.seed, "data/parsed_picks/validation/")
+    pick_generator_test = DraftPickGenerator(args.batch_size, args.num_workers, args.seed, "data/parsed_picks/validation/")
     print(f"There are {len(pick_generator_test):,} validation batches")
     print('Loading DraftBot model.')
     output_dir = f'././ml_files/{args.name}/'
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     num_batches = len(pick_generator_train)
-    tensorboard_period = num_batches // 64
-    random_embeddings = np.ones((len(card_ratings), args.embed_dims)) / 8
-    for i, _ in enumerate(card_ratings):
-        for _ in range(8):
-            j = random.randrange(args.embed_dims)
-            random_embeddings[i, j] = -1
-    random_embeddings[0] = 0
-    draftbots = DraftBot(card_ratings, random_embeddings, args.batch_size, l1_loss_weight=args.l1_weight,
-                         l2_loss_weight=args.l2_weight, embed_dims=args.embed_dims, summary_period=tensorboard_period * 16,
-                         num_heads=args.num_heads, name='DraftBots')
+    tensorboard_period = num_batches // 8
+    draftbots = DraftBot(num_cards=len(card_ratings), embed_dims=args.embed_dims, summary_period=tensorboard_period * 8,
+                         rating_l1_loss_weight=args.rating_l1_weight, rating_l2_loss_weight=args.rating_l2_weight,
+                         oracle_stddev_loss_weight=args.oracle_stddev_weight, seen_dims=args.seen_dims, picked_dims=args.picked_dims,
+                         dropout_picked_rate=args.dropout_picked, dropout_seen_rate=args.dropout_seen, dropout_dense_rate=args.dropout_dense)
     latest = tf.train.latest_checkpoint(output_dir)
-    
-    
-    class ExponentialCyclingLearningRate(tf.keras.optimizers.schedules.LearningRateSchedule):
-        def __init__(self, maximal_learning_rate=32e-03, minimal_learning_rate=1e-03, decrease_steps=61440, increase_steps=8192):
-            self.maximal_learning_rate = tf.constant(maximal_learning_rate, dtype=tf.float32)
-            self.minimal_learning_rate = tf.constant(minimal_learning_rate, dtype=tf.float32)
-            self.cycle_steps = decrease_steps + increase_steps
-            self.decreasing_rate = tf.constant((minimal_learning_rate / maximal_learning_rate) ** (1 / decrease_steps), dtype=tf.float32)
-            self.increasing_rate = tf.constant((maximal_learning_rate / minimal_learning_rate) ** (1 / increase_steps), dtype=tf.float32)
-            self.increase_steps = increase_steps
-            self.decrease_steps = decrease_steps
-            
-            
-        def __call__(self, step):
-            with tf.name_scope("CyclicalLearningRate"):
-                cycle_pos = step % self.cycle_steps
-                lr = tf.cond(cycle_pos >= self.increase_steps,
-                             lambda: self.maximal_learning_rate * (self.decreasing_rate ** tf.cast((cycle_pos - self.increase_steps) % self.decrease_steps, dtype=tf.float32)),
-                             lambda: self.minimal_learning_rate * (self.increasing_rate ** tf.cast(cycle_pos, dtype=tf.float32)))
-                tf.summary.scalar('learning_rate', lr)
-                return lr
-
     learning_rate = args.learning_rate or 0.001
     learning_rate = ExponentialCyclingLearningRate(maximal_learning_rate=learning_rate, minimal_learning_rate=learning_rate / 64,
                                                    decrease_steps=num_batches * (args.epochs - 1), increase_steps=num_batches)
@@ -253,12 +243,12 @@ if __name__ == "__main__":
         draftbots.load_weights(latest)
         # if args.learning_rate:
             # tf.keras.backend.set_value(draftbots.optimizer.lr, args.learning_rate)
-    # tf.keras.backend.set_value(draftbots.oracle_weights, [[[5, 10, 40, 40, 20, 20] for _ in range(15)] for _ in range(3)])
+    # tf.keras.backend.set_value(draftbots.oracle_weights, [[[5, 5, 5, 5, 5, 5] for _ in range(15)] for _ in range(3)])
     draftbots.compile(optimizer=opt)
     hparams = {
         HP_BATCH_SIZE: args.batch_size,
         HP_LEARNING_RATE: args.learning_rate or 0.001,
-        HP_EMBED_DIMS: args.embed_dims, HP_L2_WEGIHT: args.l2_weight, HP_NUM_HEADS: args.num_heads,
+        HP_EMBED_DIMS: args.embed_dims, HP_RATING_L2_WEGIHT: args.rating_l2_weight,
     }
 
     print('Starting training')
@@ -288,20 +278,15 @@ if __name__ == "__main__":
     nan_callback = tf.keras.callbacks.TerminateOnNaN()
     es_callback = tf.keras.callbacks.EarlyStopping(monitor='accuracy', patience=16,
                                                    mode='max', restore_best_weights=True, verbose=True)
-    lr_callback = DynamicLearningRateCallback(monitor='accuracy', shrink_factor=0.99, grow_factor=1.05, mode='max',
-                                              patience_degrading=1, cooldown_degrading=0, patience_plateau=1,
-                                              cooldown_plateau=0, min_delta=1e-03, min_lr=1e-04, max_lr=1e-00, verbose=2)
     tb_callback = TensorBoardFix(log_dir=log_dir, histogram_freq=1, write_graph=True,
                                  update_freq=tensorboard_period, embeddings_freq=None,
                                  profile_batch=0 if args.debug or not args.profile else (5 * num_batches // 4, 5 * num_batches // 4 + 64))
     hp_callback = hp.KerasCallback(log_dir, hparams)
     callbacks.append(nan_callback)
     # callbacks.append(es_callback)
-    # callbacks.append(lr_callback)
     callbacks.append(tb_callback)
     callbacks.append(hp_callback)
-    tf.summary.experimental.set_step(0)
-    # with pick_generator_train, pick_generator_test:
+    tf.summary.experimental.set_step(args.starting_step)
     with pick_generator_train:
         with pick_generator_test:
             draftbots.fit(
